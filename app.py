@@ -17,7 +17,6 @@ st.set_page_config(page_title="رادار ومستشار السورفكاست ا
 st.title("⚓ رادار ومحلل مصايد السورفكاست السريع")
 st.write("🗺️ حدد السبوت بدقة على الخريطة لحساب **سكور الصيد الرياضي ساعة بساعة** وإصدار التقرير الفيزيائي الحاسم:")
 
-# تثبيت الإحداثيات والخريطة في الذاكرة لمنع الثقل وإعادة التحميل
 if 'clicked_lat' not in st.session_state:
     st.session_state.clicked_lat = 36.4000
 if 'clicked_lon' not in st.session_state:
@@ -30,11 +29,9 @@ m = folium.Map(location=[st.session_state.clicked_lat, st.session_state.clicked_
 folium.LatLngPopup().add_to(m)
 folium.Marker([st.session_state.clicked_lat, st.session_state.clicked_lon], icon=folium.Icon(color="blue", icon="anchor", prefix="fa")).add_to(m)
 
-# عرض الخريطة
 map_data = st_folium(m, height=350, width="100%", key="fishing_map")
 
 if map_data and map_data.get("last_clicked"):
-    # تحديث الذاكرة فقط إذا تغير المكان لمنع البطء الثقيل
     if map_data["last_clicked"]["lat"] != st.session_state.clicked_lat or map_data["last_clicked"]["lng"] != st.session_state.clicked_lon:
         st.session_state.clicked_lat = map_data["last_clicked"]["lat"]
         st.session_state.clicked_lon = map_data["last_clicked"]["lng"]
@@ -46,14 +43,16 @@ lon = st.session_state.clicked_lon
 st.info(f"📍 السبوت الحالي: خط العرض ({lat:.4f}) | خط الطول ({lon:.4f})")
 
 # =====================================================================
-# 3. دالة معالجة الداتا الرياضية ساعة بساعة (مصلحة ومؤمنة 100%)
+# 3. دالة معالجة الداتا الرياضية ساعة بساعة (تم عزل الروابط بالكامل لقطع الخطأ)
 # =====================================================================
-@st.cache_data(ttl=3600)
 def process_fishing_analysis(latitude, longitude):
     try:
-        # روابط الـ API الأساسية مصاغة بدقة وبدون فراغات مضللة
-        marine_url = f"https://open-meteo.com{latitude}&longitude={longitude}&hourly=wave_height,wave_direction,wave_period&past_days=2&forecast_days=3&timezone=auto"
-        weather_url = f"https://open-meteo.com{latitude}&longitude={longitude}&hourly=wind_speed_10m,wind_direction_10m&past_days=2&forecast_days=3&timezone=auto"
+        # صياغة الروابط بشكل منفصل تماماً لمنع تداخل النصوص والـ Parsing Errors
+        base_marine = "https://open-meteo.com"
+        marine_url = f"{base_marine}?latitude={latitude}&longitude={longitude}&hourly=wave_height,wave_direction,wave_period&past_days=2&forecast_days=3&timezone=auto"
+        
+        base_weather = "https://open-meteo.com"
+        weather_url = f"{base_weather}?latitude={latitude}&longitude={longitude}&hourly=wind_speed_10m,wind_direction_10m&past_days=2&forecast_days=3&timezone=auto"
         
         marine_res = requests.get(marine_url).json()
         weather_res = requests.get(weather_url).json()
@@ -97,9 +96,10 @@ def process_fishing_analysis(latitude, longitude):
             
         return {"status": "success", "past_dirty": sea_initially_dirty, "hourly_data": hourly_scores}
     except Exception:
-        # تم إصلاح الرابط الاحتياطي بالكامل وإضافة البروكسي الآمن https://api. لمنع أي خطأ في الفرز
+        # تصحيح شامل ومفصل لرابط الطقس البديل لليابسة من الصفر وعزله عن المتغيرات
         try:
-            fallback_url = f"https://open-meteo.com{latitude}&longitude={longitude}&hourly=wind_speed_10m,wind_direction_10m&past_days=2&forecast_days=1&timezone=auto"
+            base_fallback = "https://open-meteo.com"
+            fallback_url = f"{base_fallback}?latitude={latitude}&longitude={longitude}&hourly=wind_speed_10m,wind_direction_10m&past_days=2&forecast_days=1&timezone=auto"
             fallback_res = requests.get(fallback_url).json()
             return {
                 "status": "fallback_land",
@@ -115,6 +115,8 @@ def process_fishing_analysis(latitude, longitude):
 # =====================================================================
 if st.button("🚀 إصدار القرار النهائي والحاسم للرحلة", type="primary", use_container_width=True):
     with st.spinner("⏳ نظام بايثون الرياضي السريع يقوم بفحص الجداول الحية..."):
+        # مسح كاش التصفح القديم والمكسور لفرض قراءة الكود الجديد
+        st.cache_data.clear()
         result = process_fishing_analysis(lat, lon)
         
         if result["status"] == "error":
