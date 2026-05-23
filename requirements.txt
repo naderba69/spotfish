@@ -1,31 +1,25 @@
-
----
-
-## 📄 `requirements.txt`
-
-```text
 # =============================================================================
-# SURFCASTING ADVISOR — requirements.txt
-# Render Deployment: Free Tier — Python 3.11+
-# Pin strategy: minimum floor version, allow patch updates for security fixes
+# SURFCASTING ADVISOR v2.0 — requirements.txt
+# Render Free Tier — Python 3.11+
+# All versions tested for mutual compatibility
 # =============================================================================
 
-# Core web framework
+# Core framework
 streamlit>=1.35.0,<2.0.0
 
-# Interactive map rendering
+# Interactive coastal maps
 folium>=0.16.0,<1.0.0
 streamlit-folium>=0.20.0,<1.0.0
 
-# HTTP client for Open-Meteo API (parameterized requests)
+# HTTP client — parameterized dict requests (no f-string URL building)
 requests>=2.31.0,<3.0.0
 
-# Data manipulation & DataFrame display
-pandas>=2.0.0,<3.0.0
+# Data processing — .map() used (not deprecated .applymap())
+pandas>=2.1.0,<3.0.0
 numpy>=1.26.0,<2.0.0
 
 # Google Gemini AI client
 google-generativeai>=0.7.0,<1.0.0
 
-# Timezone handling (used internally by Open-Meteo response parsing)
+# Timestamp parsing and timezone arithmetic
 python-dateutil>=2.9.0,<3.0.0
