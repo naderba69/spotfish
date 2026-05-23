@@ -1,25 +1,6 @@
-# =============================================================================
-# SURFCASTING ADVISOR v2.0 — requirements.txt
-# Render Free Tier — Python 3.11+
-# All versions tested for mutual compatibility
-# =============================================================================
-
-# Core framework
-streamlit>=1.35.0,<2.0.0
-
-# Interactive coastal maps
-folium>=0.16.0,<1.0.0
-streamlit-folium>=0.20.0,<1.0.0
-
-# HTTP client — parameterized dict requests (no f-string URL building)
-requests>=2.31.0,<3.0.0
-
-# Data processing — .map() used (not deprecated .applymap())
-pandas>=2.1.0,<3.0.0
-numpy>=1.26.0,<2.0.0
-
-# Google Gemini AI client
-google-generativeai>=0.7.0,<1.0.0
-
-# Timestamp parsing and timezone arithmetic
-python-dateutil>=2.9.0,<3.0.0
+streamlit==1.35.0
+folium==0.16.0
+streamlit-folium==0.20.0
+requests==2.32.3
+pandas==2.2.2
+google-generativeai==0.5.4
