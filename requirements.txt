@@ -1,5 +1,31 @@
-streamlit
-requests
-google-generativeai
-streamlit-folium
-folium
+
+---
+
+## 📄 `requirements.txt`
+
+```text
+# =============================================================================
+# SURFCASTING ADVISOR — requirements.txt
+# Render Deployment: Free Tier — Python 3.11+
+# Pin strategy: minimum floor version, allow patch updates for security fixes
+# =============================================================================
+
+# Core web framework
+streamlit>=1.35.0,<2.0.0
+
+# Interactive map rendering
+folium>=0.16.0,<1.0.0
+streamlit-folium>=0.20.0,<1.0.0
+
+# HTTP client for Open-Meteo API (parameterized requests)
+requests>=2.31.0,<3.0.0
+
+# Data manipulation & DataFrame display
+pandas>=2.0.0,<3.0.0
+numpy>=1.26.0,<2.0.0
+
+# Google Gemini AI client
+google-generativeai>=0.7.0,<1.0.0
+
+# Timezone handling (used internally by Open-Meteo response parsing)
+python-dateutil>=2.9.0,<3.0.0
