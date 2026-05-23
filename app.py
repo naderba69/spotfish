@@ -18,7 +18,7 @@ except ImportError:
 st.set_page_config(page_title="Surfcasting Predictor", layout="wide")
 st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcasting Dynamic Predictor)")
 
-# ---------- الحالة الدائمة (الإصلاح هنا) ----------
+# ---------- الحالة الدائمة ----------
 if "lat" not in st.session_state:
     st.session_state.lat = 36.4000
 if "lon" not in st.session_state:
@@ -29,7 +29,6 @@ if "last_processed_coords" not in st.session_state:
 # ---------- الدوال المساعدة ----------
 @st.cache_data(ttl=1800)
 def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
-    """جلب بيانات الأمواج من Open-Meteo (يومين ماضية + 3 أيام قادمة)."""
     base_url = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat,
@@ -44,7 +43,9 @@ def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
         resp.raise_for_status()
         data = resp.json()
         if "hourly" in data and data["hourly"].get("wave_height"):
-            max_wave = max((h for h in data["hourly"]["wave_height"] if h is not None), default=0)
+            # تجاهل None أثناء فحص أعلى موجة
+            valid_waves = [h for h in data["hourly"]["wave_height"] if h is not None]
+            max_wave = max(valid_waves) if valid_waves else 0
             if max_wave < 0.1:
                 return None  # نقطة داخلية
         return data
@@ -53,7 +54,6 @@ def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
 
 @st.cache_data(ttl=1800)
 def fetch_atmospheric_fallback(lat: float, lon: float) -> Dict:
-    """توقعات الطقس الجوي (احتياطي عند عدم توفر بيانات بحرية)."""
     base_url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -69,11 +69,7 @@ def fetch_atmospheric_fallback(lat: float, lon: float) -> Dict:
 
 @st.cache_data(ttl=7200)
 def get_shoreline_normal(lat: float, lon: float) -> float:
-    """
-    حساب الزاوية العمودية على الشاطئ (اتجاه البحر) باستخدام تضاريس SRTM30.
-    الزاوية 0° = شمال، 90° = شرق.
-    """
-    delta = 0.001  # ~111 متر
+    delta = 0.001
     points = []
     for dlat in (-delta, 0, delta):
         for dlon in (-delta, 0, delta):
@@ -83,7 +79,6 @@ def get_shoreline_normal(lat: float, lon: float) -> float:
     if resp.status_code != 200:
         return 0.0
     elevations = [r["elevation"] for r in resp.json()["results"]]
-    # الفروق المركزية
     dz_dlat = (elevations[7] - elevations[1]) / (2 * delta * 111320)
     dz_dlon = (elevations[5] - elevations[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
     angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
@@ -94,13 +89,17 @@ def circular_diff(a: float, b: float) -> float:
     diff = abs(a - b) % 360
     return diff if diff <= 180 else 360 - diff
 
+def safe_float(value, default=0.0):
+    """إرجاع القيمة إن كانت رقمية، وإلا default."""
+    return float(value) if value is not None else default
+
 def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal: float) -> Dict:
-    """تحليل ساعة واحدة وإرجاع قاموس بالنتائج."""
-    wave_h = hourly["wave_height"][hour_idx]
-    wave_dir = hourly["wave_direction"][hour_idx]
-    wave_per = hourly["wave_period"][hour_idx]
-    wind_spd = hourly["wind_speed_10m"][hour_idx]
-    wind_dir = hourly["wind_direction_10m"][hour_idx]
+    """تحليل ساعة واحدة مع حماية ضد None."""
+    wave_h   = safe_float(hourly["wave_height"][hour_idx])
+    wave_dir = safe_float(hourly["wave_direction"][hour_idx])
+    wave_per = safe_float(hourly["wave_period"][hour_idx])
+    wind_spd = safe_float(hourly["wind_speed_10m"][hour_idx])
+    wind_dir = safe_float(hourly["wind_direction_10m"][hour_idx])
 
     wave_angle_diff = circular_diff(wave_dir, shore_normal)
     wind_angle_diff = circular_diff(wind_dir, shore_normal)
@@ -178,7 +177,6 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
     }
 
 def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg_score: float) -> None:
-    """عرض تقرير جدولي مباشر في حال عدم توفر Gemini."""
     st.markdown(f"### 🧾 تقرير تفصيلي لـ {spot_name} - {day_label}")
     df = pd.DataFrame(results)
     st.dataframe(df[[
@@ -232,16 +230,17 @@ def main():
                 "wave_height": [0.0] * len(times),
                 "wave_direction": [0.0] * len(times),
                 "wave_period": [0.0] * len(times),
-                "wind_speed_10m": atmospheric["hourly"]["wind_speed_10m"],
-                "wind_direction_10m": atmospheric["hourly"]["wind_direction_10m"],
+                "wind_speed_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_speed_10m"]],
+                "wind_direction_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_direction_10m"]],
             }
         }
 
     hourly = marine_data["hourly"]
 
+    # حساب العكارة السابقة مع تجاهل القيم الفارغة
     if not fallback_used:
-        past_wave_h = hourly["wave_height"][:48]
-        past_wave_p = hourly["wave_period"][:48]
+        past_wave_h = [h for h in hourly["wave_height"][:48] if h is not None]
+        past_wave_p = [p for p in hourly["wave_period"][:48] if p is not None]
         avg_h = sum(past_wave_h) / len(past_wave_h) if past_wave_h else 0
         avg_p = sum(past_wave_p) / len(past_wave_p) if past_wave_p else 0
         sea_initially_dirty = avg_h > 1.2 and avg_p > 8.0
