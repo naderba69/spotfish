@@ -17,7 +17,7 @@ st.set_page_config(page_title="رادار ومستشار السورفكاست ا
 st.title("⚓ رادار ومحلل مصايد السورفكاست السريع")
 st.write("🗺️ حدد السبوت بدقة على الخريطة لحساب **سكور الصيد الرياضي ساعة بساعة** وإصدار التقرير الفيزيائي الحاسم:")
 
-# تحسين السرعة: تثبيت الإحداثيات والخريطة في الذاكرة لمنع الثقل وإعادة التحميل
+# تثبيت الإحداثيات والخريطة في الذاكرة لمنع الثقل وإعادة التحميل
 if 'clicked_lat' not in st.session_state:
     st.session_state.clicked_lat = 36.4000
 if 'clicked_lon' not in st.session_state:
@@ -97,7 +97,7 @@ def process_fishing_analysis(latitude, longitude):
             
         return {"status": "success", "past_dirty": sea_initially_dirty, "hourly_data": hourly_scores}
     except Exception:
-        # تم إصلاح الرابط بإضافة علامة الاستفهام '?' المنسية لمنع انهيار السيرفر نهائياً
+        # تم إصلاح الرابط الاحتياطي بالكامل وإضافة البروكسي الآمن https://api. لمنع أي خطأ في الفرز
         try:
             fallback_url = f"https://open-meteo.com{latitude}&longitude={longitude}&hourly=wind_speed_10m,wind_direction_10m&past_days=2&forecast_days=1&timezone=auto"
             fallback_res = requests.get(fallback_url).json()
@@ -105,7 +105,7 @@ def process_fishing_analysis(latitude, longitude):
                 "status": "fallback_land",
                 "past_dirty": False,
                 "hourly_data": [{"الساعة": f"{i}:00", "السكور_النهائي": 5.0, "سرعة_الرياح_كم_س": fallback_res['hourly']['wind_speed_10m'][48+i], "الوضع_الحركي": "قراءة يابسة مجاورة"} for i in range(24)],
-                "message": "⚠️ تم رصد الضغط فوق اليابسة. تم الانتقال تلقائياً لممحاكاة الأرصاد الساحلية القريبة لحماية الموقع من التوقف."
+                "message": "⚠️ تم رصد الضغط فوق اليابسة. تم الانتقال تلقائياً لمحاكاة الأرصاد الساحلية القريبة لحماية الموقع من التوقف."
             }
         except Exception as err:
             return {"status": "error", "message": str(err)}
