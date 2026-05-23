@@ -96,7 +96,7 @@ def calculate_shoreline_aspect(lat, lon):
         avg_sin = sum(math.sin(r) for r in sea_radians) / len(sea_radians)
         avg_cos = sum(math.cos(r) for r in sea_radians) / len(sea_radians)
         shoreline_normal = math.degrees(math.atan2(avg_sin, avg_cos)) % 360
-                return shoreline_normal, None
+        return shoreline_normal, None
     except Exception as e:
         return None, str(e)
 
@@ -341,11 +341,12 @@ def compute_scores(marine_data, weather_data, is_inland, shoreline_normal):
             lead_type = "olive"
         
         # ========== (د) تيار السحب للعمق (Rip Current Risk) ==========
-        # إذا كان الموج > 1.2م والتردد > 8ث وزاوية الموج بالساحل < 30°        if wh > 1.2 and wp > 8.0 and wave_impact < 30:
+        # إذا كان الموج > 1.2م والتردد > 8ث وزاوية الموج بالساحل < 30°        
+        if wh > 1.2 and wp > 8.0 and wave_impact < 30:
             rip_risk = "عالي جداً"
         else:
             rip_risk = "منخفض"
-        
+
         # ========== (هـ) مؤشر الأعشاب الطافية (Surface Debris Index) ==========
         # التنظيف الميكانيكي: البحر يستقر + تردد 4-7ث + زاوية الموج < 30°
         is_cleansing = (4.0 <= wp <= 7.0 and wave_impact < 30 and wh <= 1.0)
