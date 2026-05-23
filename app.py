@@ -6,6 +6,7 @@ import math
 import json
 import os
 import pandas as pd
+import datetime
 from typing import Dict, List, Optional
 
 try:
@@ -25,8 +26,16 @@ if "lon" not in st.session_state:
     st.session_state.lon = 10.6000
 if "last_processed_coords" not in st.session_state:
     st.session_state.last_processed_coords = (None, None)
+if "analysis_triggered" not in st.session_state:
+    st.session_state.analysis_triggered = False
+if "results_cache" not in st.session_state:
+    st.session_state.results_cache = None
+if "avg_score_cache" not in st.session_state:
+    st.session_state.avg_score_cache = None
+if "report_cache" not in st.session_state:
+    st.session_state.report_cache = None
 
-# ---------- الدوال المساعدة ----------
+# ---------- دوال جلب البيانات ----------
 @st.cache_data(ttl=1800)
 def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
     base_url = "https://marine-api.open-meteo.com/v1/marine"
@@ -43,11 +52,9 @@ def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
         resp.raise_for_status()
         data = resp.json()
         if "hourly" in data and data["hourly"].get("wave_height"):
-            # تجاهل None أثناء فحص أعلى موجة
-            valid_waves = [h for h in data["hourly"]["wave_height"] if h is not None]
-            max_wave = max(valid_waves) if valid_waves else 0
-            if max_wave < 0.1:
-                return None  # نقطة داخلية
+            valid = [h for h in data["hourly"]["wave_height"] if h is not None]
+            if valid and max(valid) < 0.1:
+                return None
         return data
     except Exception:
         return None
@@ -70,31 +77,26 @@ def fetch_atmospheric_fallback(lat: float, lon: float) -> Dict:
 @st.cache_data(ttl=7200)
 def get_shoreline_normal(lat: float, lon: float) -> float:
     delta = 0.001
-    points = []
-    for dlat in (-delta, 0, delta):
-        for dlon in (-delta, 0, delta):
-            points.append(f"{lat+dlat},{lon+dlon}")
+    points = [f"{lat+dlat},{lon+dlon}" for dlat in (-delta, 0, delta) for dlon in (-delta, 0, delta)]
     url = "https://api.opentopodata.org/v1/srtm30m"
     resp = requests.get(url, params={"locations": "|".join(points)}, timeout=10)
     if resp.status_code != 200:
         return 0.0
-    elevations = [r["elevation"] for r in resp.json()["results"]]
-    dz_dlat = (elevations[7] - elevations[1]) / (2 * delta * 111320)
-    dz_dlon = (elevations[5] - elevations[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
+    elev = [r["elevation"] for r in resp.json()["results"]]
+    dz_dlat = (elev[7] - elev[1]) / (2 * delta * 111320)
+    dz_dlon = (elev[5] - elev[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
     angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
     return (angle + 360) % 360
 
+# ---------- دوال حسابية ----------
 def circular_diff(a: float, b: float) -> float:
-    """الفرق الدائري المطلق بين زاويتين (0-180 درجة)."""
     diff = abs(a - b) % 360
     return diff if diff <= 180 else 360 - diff
 
 def safe_float(value, default=0.0):
-    """إرجاع القيمة إن كانت رقمية، وإلا default."""
     return float(value) if value is not None else default
 
 def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal: float) -> Dict:
-    """تحليل ساعة واحدة مع حماية ضد None."""
     wave_h   = safe_float(hourly["wave_height"][hour_idx])
     wave_dir = safe_float(hourly["wave_direction"][hour_idx])
     wave_per = safe_float(hourly["wave_period"][hour_idx])
@@ -155,7 +157,7 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         score += 2.0
     score = max(0.0, min(10.0, score))
 
-    local_hour = (hour_idx % 24 + 1) % 24
+    local_hour = (hour_idx % 24 + 1) % 24  # UTC+1
     time_str = f"{local_hour:02d}:00"
 
     return {
@@ -176,7 +178,8 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         "score": round(score, 2),
     }
 
-def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg_score: float) -> None:
+# ---------- عرض الجدول الاحتياطي ----------
+def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg_score: float):
     st.markdown(f"### 🧾 تقرير تفصيلي لـ {spot_name} - {day_label}")
     df = pd.DataFrame(results)
     st.dataframe(df[[
@@ -185,16 +188,60 @@ def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg
         "F_drag", "lead_rec", "rip_risk", "debris_status", "score"
     ]], use_container_width=True)
 
+# ---------- توليد التقرير عبر Gemini مع نماذج احتياطية ----------
+def generate_gemini_report(prompt: str) -> Optional[str]:
+    if not GENAI_AVAILABLE or not os.environ.get("GEMINI_API_KEY"):
+        return None
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    # قائمة النماذج بالترتيب الذي نحاوله
+    models_to_try = [
+        "gemini-1.5-flash",
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-pro",
+        "gemini-1.0-pro",
+    ]
+    for model_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            # إذا كان الخطأ 404 نتجاوزه لنجرب النموذج التالي
+            if "404" in str(e):
+                continue
+            # أي خطأ آخر نعرضه ونتوقف
+            else:
+                raise e
+    raise RuntimeError("جميع نماذج Gemini فشلت (تأكد من صلاحية المفتاح وتفعيل النماذج)")
+
+# ---------- دالة الأيام بالعربية ----------
+def get_day_labels():
+    weekdays_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+    today = datetime.date.today()
+    labels = []
+    for offset in range(3):
+        d = today + datetime.timedelta(days=offset)
+        weekday = weekdays_ar[d.weekday()]  # Monday=0 -> الإثنين
+        if offset == 0:
+            labels.append(f"اليوم ({weekday})")
+        elif offset == 1:
+            labels.append(f"غداً ({weekday})")
+        else:
+            labels.append(f"بعد غد ({weekday})")
+    return labels
+
 # ---------- التطبيق الرئيسي ----------
 def main():
+    # الخريطة
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
     folium.Marker(
         [st.session_state.lat, st.session_state.lon],
         popup="📍 موقع الصيد",
         icon=folium.Icon(color="red", icon="anchor"),
     ).add_to(m)
-    map_data = st_folium(m, key="surfcast_map", height=400, width=700)
 
+    # التقاط النقرة وتحديث الإحداثيات فقط دون تحليل
+    map_data = st_folium(m, key="surfcast_map", height=400, width=700)
     if map_data and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lon = map_data["last_clicked"]["lng"]
@@ -202,9 +249,12 @@ def main():
             st.session_state.lat = new_lat
             st.session_state.lon = new_lon
             st.session_state.last_processed_coords = (new_lat, new_lon)
+            # أي نقرة جديدة تلغي التحليل السابق
+            st.session_state.analysis_triggered = False
             st.rerun()
 
-    day_labels = ["اليوم الحالي", "غداً الأحد", "بعد غد الإثنين"]
+    # قائمة الأيام الديناميكية
+    day_labels = get_day_labels()
     day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
     day_offset = day_labels.index(day)
 
@@ -212,56 +262,72 @@ def main():
     lon = st.session_state.lon
     st.write(f"📍 الإحداثيات المختارة: `{lat:.4f}, {lon:.4f}`")
 
-    marine_data = fetch_marine_data(lat, lon)
-    fallback_used = False
+    # زر الفحص
+    if st.button("🔍 فحص وتحليل الموقع", type="primary"):
+        st.session_state.analysis_triggered = True
+        st.rerun()
 
-    if marine_data is None:
-        st.warning(
-            "⚠️ الإحداثيات المختارة بعيدة عن الساحل أو لا تتوفر بيانات بحرية لها. "
-            "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية. "
-            "يُرجى اختيار نقطة ساحلية للحصول على تحليل كامل."
-        )
-        fallback_used = True
-        atmospheric = fetch_atmospheric_fallback(lat, lon)
-        times = atmospheric["hourly"]["time"]
-        marine_data = {
-            "hourly": {
-                "time": times,
-                "wave_height": [0.0] * len(times),
-                "wave_direction": [0.0] * len(times),
-                "wave_period": [0.0] * len(times),
-                "wind_speed_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_speed_10m"]],
-                "wind_direction_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_direction_10m"]],
+    # لا نكمل التحليل إلا إذا ضغط المستخدم على الزر
+    if not st.session_state.analysis_triggered:
+        return
+
+    # ---------- بدء التحليل ----------
+    with st.spinner("⏳ جاري جلب البيانات وتحليلها..."):
+        marine_data = fetch_marine_data(lat, lon)
+        fallback_used = False
+
+        if marine_data is None:
+            st.warning(
+                "⚠️ الإحداثيات المختارة بعيدة عن الساحل أو لا تتوفر بيانات بحرية لها. "
+                "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية. "
+                "يُرجى اختيار نقطة ساحلية للحصول على تحليل كامل."
+            )
+            fallback_used = True
+            atmospheric = fetch_atmospheric_fallback(lat, lon)
+            times = atmospheric["hourly"]["time"]
+            marine_data = {
+                "hourly": {
+                    "time": times,
+                    "wave_height": [0.0] * len(times),
+                    "wave_direction": [0.0] * len(times),
+                    "wave_period": [0.0] * len(times),
+                    "wind_speed_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_speed_10m"]],
+                    "wind_direction_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_direction_10m"]],
+                }
             }
-        }
 
-    hourly = marine_data["hourly"]
+        hourly = marine_data["hourly"]
 
-    # حساب العكارة السابقة مع تجاهل القيم الفارغة
-    if not fallback_used:
-        past_wave_h = [h for h in hourly["wave_height"][:48] if h is not None]
-        past_wave_p = [p for p in hourly["wave_period"][:48] if p is not None]
-        avg_h = sum(past_wave_h) / len(past_wave_h) if past_wave_h else 0
-        avg_p = sum(past_wave_p) / len(past_wave_p) if past_wave_p else 0
-        sea_initially_dirty = avg_h > 1.2 and avg_p > 8.0
-    else:
-        sea_initially_dirty = False
+        # العكارة التاريخية
+        if not fallback_used:
+            past_h = [h for h in hourly["wave_height"][:48] if h is not None]
+            past_p = [p for p in hourly["wave_period"][:48] if p is not None]
+            avg_h = sum(past_h) / len(past_h) if past_h else 0
+            avg_p = sum(past_p) / len(past_p) if past_p else 0
+            sea_initially_dirty = avg_h > 1.2 and avg_p > 8.0
+        else:
+            sea_initially_dirty = False
 
-    shore_normal = get_shoreline_normal(lat, lon)
+        shore_normal = get_shoreline_normal(lat, lon)
 
-    day_start = 48 + day_offset * 24
-    day_end = day_start + 24
+        day_start = 48 + day_offset * 24
+        day_end = day_start + 24
 
-    if day_end > len(hourly["time"]):
-        st.error("❌ بيانات الساعة غير كافية لليوم المطلوب.")
-        st.stop()
+        if day_end > len(hourly["time"]):
+            st.error("❌ بيانات الساعة غير كافية لليوم المطلوب.")
+            st.stop()
 
-    results = []
-    for i in range(day_start, day_end):
-        results.append(analyze_hour(i, hourly, sea_initially_dirty, shore_normal))
+        results = []
+        for i in range(day_start, day_end):
+            results.append(analyze_hour(i, hourly, sea_initially_dirty, shore_normal))
 
-    avg_score = sum(r["score"] for r in results) / len(results)
+        avg_score = sum(r["score"] for r in results) / len(results)
 
+        # تخزين النتائج مؤقتاً
+        st.session_state.results_cache = results
+        st.session_state.avg_score_cache = avg_score
+
+    # ---------- الحكم النهائي ----------
     if avg_score >= 7.5:
         banner_color = "#28a745"
         verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
@@ -282,6 +348,7 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # ---------- اسم المكان ----------
     try:
         reverse_url = "https://nominatim.openstreetmap.org/reverse"
         reverse_params = {
@@ -294,20 +361,14 @@ def main():
         headers = {"User-Agent": "SurfcastPredictor/1.0"}
         geo_resp = requests.get(reverse_url, params=reverse_params, headers=headers, timeout=5)
         if geo_resp.status_code == 200:
-            geo_data = geo_resp.json()
-            spot_name = geo_data.get("display_name", "موقع الساحل المختار")
+            spot_name = geo_resp.json().get("display_name", "موقع الساحل المختار")
         else:
             spot_name = "موقع الساحل المختار"
     except Exception:
         spot_name = "موقع الساحل المختار"
 
-    use_gemini = GENAI_AVAILABLE and os.environ.get("GEMINI_API_KEY")
-
-    if use_gemini:
-        try:
-            genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            prompt = f"""
+    # ---------- تقرير Gemini ----------
+    prompt = f"""
 أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين (مثل: بحر مدرر، مصفاة الموج، إيكوم، الريح الجنب، سبايك، ثقالة هرمية...).
 لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة، مع الإشارة الدقيقة إلى توقيت تحول البحر من حال إلى آخر.
 
@@ -325,15 +386,13 @@ def main():
 4. ## الحكم النهائي القاطع (استثنائي، ممكن، أو مستحيل)
 5. ## الاستراتيجية التكتيكية للصيد (نوع الثقالة، وزنها، مسافة الرمي، تحسين الطعم) أو اقتراح نافذة جوية بديلة في حالة الإلغاء
 """
-            with st.spinner("🧠 جاري تحليل البيانات وإعداد التقرير الذكي..."):
-                response = model.generate_content(prompt)
-                st.markdown(response.text, unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"⚠️ تعذر توليد التقرير الذكي: {e}")
-            st.info("سيتم عرض جدول البيانات التفصيلي بدلاً من ذلك.")
-            render_table_report(results, spot_name, day, avg_score)
-    else:
-        st.info("ℹ️ مفتاح Gemini API غير مضبوط. جاري عرض التقرير الجدولي.")
+    try:
+        with st.spinner("🧠 يولد التقرير الذكي..."):
+            report = generate_gemini_report(prompt)
+            st.markdown(report, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"⚠️ تعذر توليد التقرير الذكي: {e}")
+        st.info("يُعرض جدول البيانات المباشر.")
         render_table_report(results, spot_name, day, avg_score)
 
 if __name__ == "__main__":
