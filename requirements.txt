@@ -1,0 +1,5 @@
+streamlit
+requests
+google-generativeai
+streamlit-folium
+folium
