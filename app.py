@@ -1,5 +1,6 @@
 import streamlit as st
 import folium
+from folium import plugins
 from streamlit_folium import st_folium
 import requests
 import math
@@ -22,7 +23,7 @@ st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcast
 # ---------- الحالة الدائمة ----------
 if "lat" not in st.session_state:
     st.session_state.lat = 36.4000
-if "lon" not in st.session_state:
+if "lon" not in st.session_state.lon:
     st.session_state.lon = 10.6000
 if "last_processed_coords" not in st.session_state:
     st.session_state.last_processed_coords = (None, None)
@@ -32,8 +33,8 @@ if "results_cache" not in st.session_state:
     st.session_state.results_cache = None
 if "avg_score_cache" not in st.session_state:
     st.session_state.avg_score_cache = None
-if "report_cache" not in st.session_state:
-    st.session_state.report_cache = None
+if "live_coords" not in st.session_state:
+    st.session_state.live_coords = "حرك الفأرة فوق الخريطة"
 
 # ---------- دوال جلب البيانات ----------
 @st.cache_data(ttl=1800)
@@ -157,7 +158,7 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         score += 2.0
     score = max(0.0, min(10.0, score))
 
-    local_hour = (hour_idx % 24 + 1) % 24  # UTC+1
+    local_hour = (hour_idx % 24 + 1) % 24
     time_str = f"{local_hour:02d}:00"
 
     return {
@@ -178,7 +179,6 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         "score": round(score, 2),
     }
 
-# ---------- عرض الجدول الاحتياطي ----------
 def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg_score: float):
     st.markdown(f"### 🧾 تقرير تفصيلي لـ {spot_name} - {day_label}")
     df = pd.DataFrame(results)
@@ -188,17 +188,14 @@ def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg
         "F_drag", "lead_rec", "rip_risk", "debris_status", "score"
     ]], use_container_width=True)
 
-# ---------- توليد التقرير عبر Gemini مع نماذج احتياطية ----------
 def generate_gemini_report(prompt: str) -> Optional[str]:
     if not GENAI_AVAILABLE or not os.environ.get("GEMINI_API_KEY"):
         return None
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # قائمة النماذج بالترتيب الذي نحاوله
+    # نماذج متوافقة مع الإصدار الحالي
     models_to_try = [
+        "gemini-2.0-flash-lite",
         "gemini-1.5-flash",
-        "gemini-2.0-flash-exp",
-        "gemini-1.5-pro",
-        "gemini-1.0-pro",
     ]
     for model_name in models_to_try:
         try:
@@ -206,22 +203,22 @@ def generate_gemini_report(prompt: str) -> Optional[str]:
             response = model.generate_content(prompt)
             return response.text
         except Exception as e:
-            # إذا كان الخطأ 404 نتجاوزه لنجرب النموذج التالي
-            if "404" in str(e):
+            if "404" in str(e) or "not found" in str(e).lower():
                 continue
-            # أي خطأ آخر نعرضه ونتوقف
             else:
                 raise e
-    raise RuntimeError("جميع نماذج Gemini فشلت (تأكد من صلاحية المفتاح وتفعيل النماذج)")
+    raise RuntimeError(
+        "جميع نماذج Gemini فشلت. تأكد من أن مفتاح API صالح وأن النماذج "
+        "`gemini-2.0-flash-lite` أو `gemini-1.5-flash` مفعلة في Google AI Studio."
+    )
 
-# ---------- دالة الأيام بالعربية ----------
 def get_day_labels():
     weekdays_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
     today = datetime.date.today()
     labels = []
     for offset in range(3):
         d = today + datetime.timedelta(days=offset)
-        weekday = weekdays_ar[d.weekday()]  # Monday=0 -> الإثنين
+        weekday = weekdays_ar[d.weekday()]
         if offset == 0:
             labels.append(f"اليوم ({weekday})")
         elif offset == 1:
@@ -232,16 +229,50 @@ def get_day_labels():
 
 # ---------- التطبيق الرئيسي ----------
 def main():
-    # الخريطة
+    # ---------- الخريطة مع الفيزور العائم ----------
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
+
+    # فيزور متحرك (دائرة زرقاء تتبع الماوس)
+    cursor_js = """
+    var cursorMarker = L.circleMarker([0,0], {
+        radius: 8,
+        color: '#0066ff',
+        fillColor: '#0066ff',
+        fillOpacity: 0.4,
+        weight: 2,
+        interactive: false
+    }).addTo(map);
+
+    map.on('mousemove', function(e) {
+        cursorMarker.setLatLng(e.latlng);
+        // إرسال الإحداثيات إلى Streamlit عبر message
+        if (typeof Streamlit !== 'undefined') {
+            Streamlit.setComponentValue({live_lat: e.latlng.lat.toFixed(4), live_lng: e.latlng.lng.toFixed(4)});
+        }
+    });
+    """
+    m.get_root().html.add_child(folium.Element(f"<script>{cursor_js}</script>"))
+
+    # علامة المكان المختار
     folium.Marker(
         [st.session_state.lat, st.session_state.lon],
         popup="📍 موقع الصيد",
         icon=folium.Icon(color="red", icon="anchor"),
     ).add_to(m)
 
-    # التقاط النقرة وتحديث الإحداثيات فقط دون تحليل
-    map_data = st_folium(m, key="surfcast_map", height=400, width=700)
+    # التقاط النقر
+    map_data = st_folium(m, key="surfcast_map", height=450, width=700)
+
+    # تحديث الإحداثيات المباشرة من الفيزور (تأتي عبر st_folium من الـ JS)
+    if map_data and "live_lat" in map_data:
+        st.session_state.live_coords = f"🖱️ {map_data['live_lat']}, {map_data['live_lng']}"
+    else:
+        st.session_state.live_coords = "حرك الفأرة فوق الخريطة"
+
+    # عرض الإحداثيات المباشرة
+    st.caption(st.session_state.live_coords)
+
+    # معالجة النقرة النهائية
     if map_data and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lon = map_data["last_clicked"]["lng"]
@@ -249,29 +280,26 @@ def main():
             st.session_state.lat = new_lat
             st.session_state.lon = new_lon
             st.session_state.last_processed_coords = (new_lat, new_lon)
-            # أي نقرة جديدة تلغي التحليل السابق
             st.session_state.analysis_triggered = False
             st.rerun()
 
-    # قائمة الأيام الديناميكية
+    # ---------- واجهة الاختيار ----------
     day_labels = get_day_labels()
     day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
     day_offset = day_labels.index(day)
 
     lat = st.session_state.lat
     lon = st.session_state.lon
-    st.write(f"📍 الإحداثيات المختارة: `{lat:.4f}, {lon:.4f}`")
+    st.write(f"📍 الإحداثيات المثبتة: `{lat:.4f}, {lon:.4f}`")
 
-    # زر الفحص
     if st.button("🔍 فحص وتحليل الموقع", type="primary"):
         st.session_state.analysis_triggered = True
         st.rerun()
 
-    # لا نكمل التحليل إلا إذا ضغط المستخدم على الزر
     if not st.session_state.analysis_triggered:
         return
 
-    # ---------- بدء التحليل ----------
+    # ---------- التحليل ----------
     with st.spinner("⏳ جاري جلب البيانات وتحليلها..."):
         marine_data = fetch_marine_data(lat, lon)
         fallback_used = False
@@ -298,7 +326,6 @@ def main():
 
         hourly = marine_data["hourly"]
 
-        # العكارة التاريخية
         if not fallback_used:
             past_h = [h for h in hourly["wave_height"][:48] if h is not None]
             past_p = [p for p in hourly["wave_period"][:48] if p is not None]
@@ -323,11 +350,7 @@ def main():
 
         avg_score = sum(r["score"] for r in results) / len(results)
 
-        # تخزين النتائج مؤقتاً
-        st.session_state.results_cache = results
-        st.session_state.avg_score_cache = avg_score
-
-    # ---------- الحكم النهائي ----------
+    # ---------- عرض الحكم ----------
     if avg_score >= 7.5:
         banner_color = "#28a745"
         verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
