@@ -5,11 +5,9 @@ import requests
 import math
 import json
 import os
-import datetime
 import pandas as pd
 from typing import Dict, List, Optional
 
-# Google Generative AI (اختياري)
 try:
     import google.generativeai as genai
     GENAI_AVAILABLE = True
@@ -20,10 +18,10 @@ except ImportError:
 st.set_page_config(page_title="Surfcasting Predictor", layout="wide")
 st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcasting Dynamic Predictor)")
 
-# ---------- الحالة الدائمة ----------
+# ---------- الحالة الدائمة (الإصلاح هنا) ----------
 if "lat" not in st.session_state:
     st.session_state.lat = 36.4000
-if "lon" not in st.session_state.lon:
+if "lon" not in st.session_state:
     st.session_state.lon = 10.6000
 if "last_processed_coords" not in st.session_state:
     st.session_state.last_processed_coords = (None, None)
@@ -45,11 +43,10 @@ def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
         resp = requests.get(base_url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        # فحص ما إذا كانت جميع قيم الموج صفراً أو شبه صفرية → نقطة داخلية
         if "hourly" in data and data["hourly"].get("wave_height"):
             max_wave = max((h for h in data["hourly"]["wave_height"] if h is not None), default=0)
             if max_wave < 0.1:
-                return None  # سنُشغّل وضع الطوارئ
+                return None  # نقطة داخلية
         return data
     except Exception:
         return None
@@ -87,12 +84,9 @@ def get_shoreline_normal(lat: float, lon: float) -> float:
         return 0.0
     elevations = [r["elevation"] for r in resp.json()["results"]]
     # الفروق المركزية
-    # شمال (0,0) -> index 7، جنوب (0,0) -> index 1
     dz_dlat = (elevations[7] - elevations[1]) / (2 * delta * 111320)
-    # شرق (0,0) -> index 5، غرب (0,0) -> index 3
     dz_dlon = (elevations[5] - elevations[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
-    # اتجاه الانحدار نحو البحر هو عكس التدرج
-    angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))  # atan2(x,y) يعطي زاوية من الشمال
+    angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
     return (angle + 360) % 360
 
 def circular_diff(a: float, b: float) -> float:
@@ -112,23 +106,19 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
     wind_angle_diff = circular_diff(wind_dir, shore_normal)
     wave_angle_rad = math.radians(wave_angle_diff)
 
-    # تأثير الرياح
     wind_impact = "ريح وش مستقيمة وممتازة"
     if 30 < wind_angle_diff < 150:
         wind_impact = "ريح جنب مائلة جارفة"
 
-    # سرعة التيار الموازي للشاطئ
     V_longshore = 0.0
     if wave_h > 0.1 and wave_angle_diff > 15:
         V_longshore = 1.17 * math.sqrt(9.81 * wave_h) * math.sin(wave_angle_rad) * math.cos(wave_angle_rad)
 
-    # قوة السحب على الثقالة (نيوتن)
     A_exposed = 0.0025
     rho = 1025
     Cd = 1.5
     F_drag = 0.5 * rho * Cd * A_exposed * (V_longshore ** 2)
 
-    # توصية الثقالة
     if F_drag > 2.5:
         lead_rec = "140g-150g سبايك (Spike)"
     elif F_drag > 1.0:
@@ -136,12 +126,10 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
     else:
         lead_rec = "100g-110g ثقالة عادية"
 
-    # خطر تيار السحب للعمق
     rip_risk = "منخفض"
     if wave_h > 1.2 and wave_per > 8.0 and wave_angle_diff < 30:
         rip_risk = "عالي جداً (خطر الرمي في المجرى)"
 
-    # حالة الأعشاب / صفاء الماء
     wave_wind_diff = circular_diff(wave_dir, wind_dir)
     opposing_wind = 90 < wave_wind_diff < 270
 
@@ -155,7 +143,6 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         if wave_h > 1.2 and wave_per > 8.0:
             debris_status = "بداية تقليب القاع واتساخ الماء"
 
-    # النقاط (من 10)
     score = 10.0
     if wave_h < 0.2:
         score -= 3.0
@@ -169,7 +156,6 @@ def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal
         score += 2.0
     score = max(0.0, min(10.0, score))
 
-    # التوقيت المحلي (تونس UTC+1)
     local_hour = (hour_idx % 24 + 1) % 24
     time_str = f"{local_hour:02d}:00"
 
@@ -203,7 +189,6 @@ def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg
 
 # ---------- التطبيق الرئيسي ----------
 def main():
-    # الخريطة
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
     folium.Marker(
         [st.session_state.lat, st.session_state.lon],
@@ -212,7 +197,6 @@ def main():
     ).add_to(m)
     map_data = st_folium(m, key="surfcast_map", height=400, width=700)
 
-    # التقاط النقرة الجديدة
     if map_data and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lon = map_data["last_clicked"]["lng"]
@@ -222,7 +206,6 @@ def main():
             st.session_state.last_processed_coords = (new_lat, new_lon)
             st.rerun()
 
-    # اختيار اليوم
     day_labels = ["اليوم الحالي", "غداً الأحد", "بعد غد الإثنين"]
     day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
     day_offset = day_labels.index(day)
@@ -231,12 +214,10 @@ def main():
     lon = st.session_state.lon
     st.write(f"📍 الإحداثيات المختارة: `{lat:.4f}, {lon:.4f}`")
 
-    # ---------- جلب البيانات وفحص النقطة الداخلية ----------
     marine_data = fetch_marine_data(lat, lon)
     fallback_used = False
 
     if marine_data is None:
-        # إما فشل الاتصال أو نقطة داخلية اكتُشفت مسبقاً
         st.warning(
             "⚠️ الإحداثيات المختارة بعيدة عن الساحل أو لا تتوفر بيانات بحرية لها. "
             "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية. "
@@ -244,7 +225,6 @@ def main():
         )
         fallback_used = True
         atmospheric = fetch_atmospheric_fallback(lat, lon)
-        # بناء قاموس بحري وهمي
         times = atmospheric["hourly"]["time"]
         marine_data = {
             "hourly": {
@@ -259,7 +239,6 @@ def main():
 
     hourly = marine_data["hourly"]
 
-    # تحديد ما إذا كان البحر متسخاً (فقط إذا لدينا بيانات حقيقية للأمواج)
     if not fallback_used:
         past_wave_h = hourly["wave_height"][:48]
         past_wave_p = hourly["wave_period"][:48]
@@ -269,10 +248,8 @@ def main():
     else:
         sea_initially_dirty = False
 
-    # الزاوية العمودية للشاطئ
     shore_normal = get_shoreline_normal(lat, lon)
 
-    # تحديد كتلة اليوم المختار
     day_start = 48 + day_offset * 24
     day_end = day_start + 24
 
@@ -280,14 +257,12 @@ def main():
         st.error("❌ بيانات الساعة غير كافية لليوم المطلوب.")
         st.stop()
 
-    # ---------- التحليل ساعة بساعة ----------
     results = []
     for i in range(day_start, day_end):
         results.append(analyze_hour(i, hourly, sea_initially_dirty, shore_normal))
 
     avg_score = sum(r["score"] for r in results) / len(results)
 
-    # ---------- شارة الحكم النهائي ----------
     if avg_score >= 7.5:
         banner_color = "#28a745"
         verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
@@ -308,7 +283,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ---------- اسم المكان (ترميز جغرافي عكسي) ----------
     try:
         reverse_url = "https://nominatim.openstreetmap.org/reverse"
         reverse_params = {
@@ -328,7 +302,6 @@ def main():
     except Exception:
         spot_name = "موقع الساحل المختار"
 
-    # ---------- تقرير Gemini أو الجدول الاحتياطي ----------
     use_gemini = GENAI_AVAILABLE and os.environ.get("GEMINI_API_KEY")
 
     if use_gemini:
