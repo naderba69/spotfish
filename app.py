@@ -1,888 +1,883 @@
-# =============================================================================
-# SURFCASTING FISHING ADVISOR — app.py  ★ FINAL CORRECTED VERSION ★
-# North African / Tunisian Coastal Hydrodynamics Decision Engine
-# All 12 audit bugs fixed + Nabeul governorate geo-coastal database
-# Deployment: Render Free Tier — Python 3.11+
-# =============================================================================
-
 import os
 import json
 import math
-import time
 import requests
-import pandas as pd
-import folium
 import streamlit as st
-import google.generativeai as genai
+import folium
+import pandas as pd
 from streamlit_folium import st_folium
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
+import google.generativeai as genai
 
-# =============================================================================
-# 0. PAGE CONFIGURATION — MUST be the absolute first Streamlit call
-# =============================================================================
+# ==========================================
+# STREAMLIT CONFIG
+# ==========================================
 st.set_page_config(
-    page_title="مستشار صيد الشاطئ 🎣",
+    page_title="المحلل الهيدروديناميكي الشامل | تونس v5.0",
     page_icon="🎣",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="collapsed"
 )
 
-# =============================================================================
-# 1. GLOBAL SCORING CONSTANTS — Single source of truth, never duplicated
-# =============================================================================
-DEFAULT_LAT: float = 36.4500
-DEFAULT_LON: float = 10.7800
-
-# BUG FIX #9: Force UTC on both APIs to prevent timezone drift between arrays
-TIMEZONE: str = "UTC"
-
-MARINE_API_BASE: str  = "https://marine-api.open-meteo.com/v1/marine"
-WEATHER_API_BASE: str = "https://api.open-meteo.com/v1/forecast"
-PAST_DAYS:        int = 2
-FORECAST_DAYS:    int = 3
-HISTORY_HOURS:    int = 48          # past 48 h window for baseline analysis
-
-# --- Scoring thresholds ---
-DEAD_SEA_MAX_H:       float = 0.30  # m   — no biological movement below this
-DEAD_SEA_PENALTY:     float = 3.00
-
-WEED_MIN_H:           float = 1.20  # m   — seabed scraping threshold
-WEED_MIN_T:           float = 8.00  # s
-WEED_PENALTY:         float = 4.50
-
-LATERAL_ANGLE_LOW:    float = 30.0  # °   — oblique coastal band start
-LATERAL_ANGLE_HIGH:   float = 150.0 # °   — oblique coastal band end
-LATERAL_STRONG_SPD:   float = 22.0  # km/h
-LATERAL_STRONG_PEN:   float = 4.00
-LATERAL_MOD_SPD:      float = 18.0
-LATERAL_MOD_PEN:      float = 1.50
-
-FOAM_MIN_H:           float = 0.50  # m
-FOAM_MAX_H:           float = 1.20  # m
-FOAM_MIN_SPD:         float = 12.0  # km/h
-FOAM_BONUS:           float = 1.50
-
-SIEVE_MIN_T:          float = 4.00  # s
-SIEVE_MAX_T:          float = 7.00  # s
-SIEVE_MIN_H:          float = 0.50  # m
-SIEVE_BONUS:          float = 2.00
-
-DIRTY_DECAY_HOURS:    float = 24.0  # hours over which dirty baseline fades
-SCORE_MAX:            float = 10.0
-SCORE_MIN:            float = 0.0
-SCORE_BASELINE:       float = 10.0
-
-GO_MIN_AVG:           float = 6.0   # BUG FIX #8: AND logic — avg must meet this
-GO_MIN_HOURS:         int   = 8     # BUG FIX #8: AND minimum good hours (not 6)
-
-# =============================================================================
-# 2. COASTAL GEO-DATABASE — Tunisian Shoreline Normals
-#    BUG FIX #3: wind assessed against SHORE normal, not wave direction
-#
-#    shoreline_normal = compass bearing (°) pointing SEAWARD (perpendicular to coast)
-#    0° = seaward direction faces True North
-#    90° = seaward direction faces True East
-#
-#    Nabeul Governorate zones are split at fine resolution because:
-#      - الرتيبة  (Rteiba)      : eastern Gulf of Hammamet shore → faces E  → normal ≈ 90°
-#                                  North wind = lateral, East wind = frontal وش
-#      - سيدي محرصي (Sidi Mahrassi): transitional NE shore cap  → faces NE → normal ≈ 55°
-#                                  NW wind = oblique وس
-#      - كركوان  (Kerkouane)   : northern cap face, Cap Bon tip  → faces N  → normal ≈ 15°
-#                                  SW/SE wind = lateral جانبي
-# =============================================================================
-COASTAL_ZONES: list[dict] = [
-
-    # ── NABEUL GOVERNORATE — High-resolution sub-zones ──────────────────────
-    {
-        "name_ar":  "الرتيبة — خليج الحمامات الشرقي",
-        "name_fr":  "Rteiba — Gulf of Hammamet East",
-        "lat_min":  36.37, "lat_max": 36.52,
-        "lon_min":  10.58, "lon_max": 10.78,
-        "normal":   90.0,   # faces due East
-        "depth_profile": "رملي ضحل — sandy shallow",
-        "target_species": "تاكوست، سباط، دنيس صغير",
-        "wind_notes": "ريح الشرق = وش مثالي | ريح الشمال = جانبي | ريح الغرب = ظهري",
-    },
-    {
-        "name_ar":  "سيدي محرصي — الرأس الانتقالي",
-        "name_fr":  "Sidi Mahrassi — Transitional Cape",
-        "lat_min":  36.52, "lat_max": 36.72,
-        "lon_min":  10.68, "lon_max": 10.92,
-        "normal":   55.0,   # faces NE
-        "depth_profile": "صخري-رملي مختلط",
-        "target_species": "مورين، سباط، شرش",
-        "wind_notes": "ريح الشمال الشرقي = وش | ريح الشمال الغربي = وس مائل | ريح الجنوب = ظهري",
-    },
-    {
-        "name_ar":  "كركوان — رأس بون الشمالي",
-        "name_fr":  "Kerkouane — Cap Bon North",
-        "lat_min":  36.72, "lat_max": 37.10,
-        "lon_min":  10.92, "lon_max": 11.18,
-        "normal":   15.0,   # faces NNE (northern tip of Cap Bon)
-        "depth_profile": "صخري عميق — rocky deep",
-        "target_species": "مورين، لُقُّوس، سرغ، روبيان خشن",
-        "wind_notes": "ريح الشمال = وش | ريح الشرق/الغرب = جانبي | ريح الجنوب = ظهري مساعد",
-    },
-    {
-        "name_ar":  "نابل — المدينة",
-        "name_fr":  "Nabeul — City Front",
-        "lat_min":  36.44, "lat_max": 36.50,
-        "lon_min":  10.72, "lon_max": 10.80,
-        "normal":   82.0,   # slight NE tilt
-        "depth_profile": "رملي متوسط",
-        "target_species": "تاكوست، سباط",
-        "wind_notes": "ريح الشرق-شمال الشرقي = وش | ريح الشمال = وس مائل",
-    },
-    {
-        "name_ar":  "قربة — خليج الحمامات الجنوبي",
-        "name_fr":  "Korba — Gulf of Hammamet South",
-        "lat_min":  36.55, "lat_max": 36.72,
-        "lon_min":  10.78, "lon_max": 10.95,
-        "normal":   70.0,   # ENE
-        "depth_profile": "رملي عميق تدريجياً",
-        "target_species": "دنيس، تاكوست كبير",
-        "wind_notes": "ريح الشرق-شمال = وش | ريح الشمال = وس جزئي",
-    },
-    {
-        "name_ar":  "الحمامات الجنوبية",
-        "name_fr":  "Hammamet South",
-        "lat_min":  36.34, "lat_max": 36.44,
-        "lon_min":  10.55, "lon_max": 10.72,
-        "normal":   95.0,   # slightly south of East
-        "depth_profile": "رملي مفتوح",
-        "target_species": "تاكوست، سباط نهاري",
-        "wind_notes": "ريح الشرق الجنوبي = وش | ريح الشمال = جانبي كبير",
-    },
-
-    # ── GREATER TUNIS / NORTH ────────────────────────────────────────────────
-    {
-        "name_ar":  "بنزرت — الشاطئ الشمالي",
-        "name_fr":  "Bizerte — Northern Shore",
-        "lat_min":  37.20, "lat_max": 37.40,
-        "lon_min":  9.75,  "lon_max": 10.05,
-        "normal":   330.0,  # NNW — faces open Mediterranean
-        "depth_profile": "صخري-رملي",
-        "target_species": "تون، سرغ، مكنين",
-        "wind_notes": "ريح الشمال الشمالي الغربي = وش | ريح الغرب = وس جانبي",
-    },
-    {
-        "name_ar":  "رأس الطيب",
-        "name_fr":  "Ras El Tib",
-        "lat_min":  37.05, "lat_max": 37.20,
-        "lon_min":  11.00, "lon_max": 11.18,
-        "normal":   45.0,   # NE facing
-        "depth_profile": "صخري عميق",
-        "target_species": "مورين، شرش، سرغ",
-        "wind_notes": "ريح الشمال الشرقي = وش | ريح الشمال = وس قليل",
-    },
-    {
-        "name_ar":  "خليج تونس الشرقي — رادس",
-        "name_fr":  "Gulf of Tunis East — Rades",
-        "lat_min":  36.75, "lat_max": 37.05,
-        "lon_min":  10.18, "lon_max": 10.45,
-        "normal":   60.0,
-        "depth_profile": "طيني-رملي",
-        "target_species": "سباط، تاكوست",
-        "wind_notes": "ريح الشمال الشرقي = وش",
-    },
-
-    # ── SAHEL / CENTER ───────────────────────────────────────────────────────
-    {
-        "name_ar":  "سوسة — الشاطئ الشرقي",
-        "name_fr":  "Sousse — Eastern Beach",
-        "lat_min":  35.70, "lat_max": 36.05,
-        "lon_min":  10.55, "lon_max": 10.75,
-        "normal":   85.0,
-        "depth_profile": "رملي مفتوح",
-        "target_species": "تاكوست، دنيس، سباط",
-        "wind_notes": "ريح الشرق = وش مثالي | ريح الشمال = وس مائل",
-    },
-    {
-        "name_ar":  "المهدية",
-        "name_fr":  "Mahdia",
-        "lat_min":  35.35, "lat_max": 35.65,
-        "lon_min":  10.95, "lon_max": 11.15,
-        "normal":   75.0,
-        "depth_profile": "صخري-رملي متبادل",
-        "target_species": "مورين ليلي، دنيس، شرش",
-        "wind_notes": "ريح الشرق = وش | ريح الشمال الشرقي = وش قوي | ريح الشمال = وس",
-    },
-    {
-        "name_ar":  "صفاقس — خليج قابس الشمالي",
-        "name_fr":  "Sfax — North Gulf of Gabes",
-        "lat_min":  34.55, "lat_max": 35.35,
-        "lon_min":  10.55, "lon_max": 11.10,
-        "normal":   100.0,  # ESE — shallow gulf
-        "depth_profile": "طيني ضحل — تأثير مدي قوي",
-        "target_species": "روبيان، قرباس، سيج",
-        "wind_notes": "تأثير المد والجزر أهم من الريح في هذه المنطقة",
-    },
-
-    # ── SOUTH / DJERBA ───────────────────────────────────────────────────────
-    {
-        "name_ar":  "جربة — الشاطئ الشمالي",
-        "name_fr":  "Djerba — North Shore",
-        "lat_min":  33.85, "lat_max": 33.95,
-        "lon_min":  10.85, "lon_max": 11.10,
-        "normal":   10.0,   # faces North
-        "depth_profile": "رملي ضحل أبيض",
-        "target_species": "دنيس، سباط، بلطي بحري",
-        "wind_notes": "ريح الشمال = وش | ريح الشرق/الغرب = جانبي شديد",
-    },
-    {
-        "name_ar":  "جربة — الشاطئ الشرقي",
-        "name_fr":  "Djerba — East Shore",
-        "lat_min":  33.72, "lat_max": 33.86,
-        "lon_min":  11.05, "lon_max": 11.22,
-        "normal":   80.0,
-        "depth_profile": "رملي-صخري",
-        "target_species": "دنيس، تاكوست",
-        "wind_notes": "ريح الشرق = وش | ريح الجنوب = وس جانبي",
-    },
-    {
-        "name_ar":  "زارزيس — الساحل الجنوبي",
-        "name_fr":  "Zarzis — Southern Coast",
-        "lat_min":  33.40, "lat_max": 33.72,
-        "lon_min":  11.05, "lon_max": 11.40,
-        "normal":   120.0,  # SSE
-        "depth_profile": "رملي مع صخور متناثرة",
-        "target_species": "دنيس كبير، مكنين، روبيان",
-        "wind_notes": "ريح الجنوب الشرقي = وش | ريح الشرق = وس",
-    },
-]
-
-
-def get_coastal_zone(lat: float, lon: float) -> dict:
-    """
-    Returns the matching coastal zone dict for the given coordinates.
-    Falls back to a generic Mediterranean default if no zone matches.
-    BUG FIX #3: provides real shoreline_normal for each local zone.
-    """
-    for zone in COASTAL_ZONES:
-        if (zone["lat_min"] <= lat <= zone["lat_max"] and
-                zone["lon_min"] <= lon <= zone["lon_max"]):
-            return zone
-
-    # Generic Mediterranean default (East-facing coast assumption)
-    return {
-        "name_ar":  "ساحل متوسطي غير محدد",
-        "name_fr":  "Unregistered Mediterranean Coast",
-        "normal":   90.0,
-        "depth_profile": "غير معروف",
-        "target_species": "غير محدد",
-        "wind_notes": "استخدام اتجاه شرقي افتراضي — حدد موقعاً ساحلياً معروفاً",
-    }
-
-
-# =============================================================================
-# 3. SESSION STATE BOOTSTRAP — idempotent, safe on every rerun
-# =============================================================================
-def _init_session() -> None:
-    defaults = {
-        "lat":               DEFAULT_LAT,
-        "lon":               DEFAULT_LON,
-        "data_ready":        False,
-        "scores":            None,
-        "avg_score":         0.0,
-        "max_score":         0.0,
-        "best_hour":         "N/A",
-        "go_hours":          0,
-        "go_decision":       "NO-GO",
-        "sea_dirty":         False,
-        "is_inland":         False,
-        "zone":              None,
-        "gemini_report":     None,
-        "past_avg_h":        0.0,
-        "past_avg_t":        0.0,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-_init_session()
-
-# =============================================================================
-# 4. CUSTOM CSS — RTL + score palette + premium UI
-# =============================================================================
 st.markdown("""
 <style>
-    /* RTL Arabic rendering */
-    .rtl { direction: rtl; text-align: right;
-           font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
-           font-size: 1.05em; line-height: 1.8; }
-
-    /* Score color system */
-    .s-green  { color: #1e8449; font-weight: 700; }
-    .s-yellow { color: #b7950b; font-weight: 700; }
-    .s-red    { color: #922b21; font-weight: 700; }
-
-    /* Header banner */
-    .banner {
-        background: linear-gradient(135deg, #0b2545, #1565c0, #0288d1);
-        padding: 22px 30px; border-radius: 14px; margin-bottom: 20px;
-    }
-    .banner h1 { color: #ffffff; margin: 0; font-size: 1.9em; }
-    .banner p  { color: #b3d4f5; margin: 6px 0 0 0; font-size: 0.95em; }
-
-    /* Zone info card */
-    .zone-card {
-        background: #0d3349; color: #e8f4fd;
-        border-left: 4px solid #0288d1;
-        padding: 12px 18px; border-radius: 8px;
-        margin: 10px 0; font-size: 0.92em;
-    }
-    .zone-card b { color: #4fc3f7; }
-
-    /* Map iframe */
-    iframe { border-radius: 12px; }
-
-    /* Streamlit block padding */
-    .block-container { padding-top: 0.8rem; }
+    .stMetric {background: #0e1117; padding: 15px; border-radius: 8px; border-left: 4px solid #1f77b4;}
+    .go-excellent {color: #00ff00; font-weight: bold; font-size: 1.3em;}
+    .go-good {color: #ffff00; font-weight: bold; font-size: 1.3em;}
+    .go-warning {color: #ffa500; font-weight: bold; font-size: 1.3em;}
+    .go-nogo {color: #ff0000; font-weight: bold; font-size: 1.3em;}
+    .risk-high {color: #ff4b4b; font-weight: bold;}
+    .risk-med {color: #ffa500; font-weight: bold;}
+    .risk-low {color: #00cc00; font-weight: bold;}
+    .drift-yes {color: #ff4b4b; font-weight: bold;}
+    .drift-no {color: #00cc00;}
+    .debris-heavy {color: #ff4b4b; font-weight: bold;}
+    .debris-med {color: #ffa500;}
+    .debris-light {color: #ffff00;}
+    .debris-clean {color: #00cc00;}
 </style>
 """, unsafe_allow_html=True)
 
-# =============================================================================
-# 5. HEADER
-# =============================================================================
-st.markdown("""
-<div class="banner">
-  <h1>🎣 مستشار صيد الشاطئ — Surfcasting Advisor</h1>
-  <p>محرك الهيدروديناميكا الساحلية النهائي — ولاية نابل والسواحل التونسية •
-     Final Coastal Hydrodynamics Decision Engine</p>
-</div>
-""", unsafe_allow_html=True)
+# Session state
+if 'lat_a' not in st.session_state:
+    st.session_state.lat_a = 36.4000  # الحمامات
+if 'lon_a' not in st.session_state:
+    st.session_state.lon_a = 10.6000
+if 'lat_b' not in st.session_state:
+    st.session_state.lat_b = 36.8200  # نابل
+if 'lon_b' not in st.session_state:
+    st.session_state.lon_b = 10.7800
+if 'compare_mode' not in st.session_state:    st.session_state.compare_mode = False
 
-# =============================================================================
-# 6. INTERACTIVE FOLIUM MAP — Zero-lag reactive coordinates
-# =============================================================================
-st.subheader("📍 اختر نقطة الصيد / Select Fishing Spot")
-st.caption(
-    "انقر مباشرة على الشاطئ • بطاقات المناطق الزرقاء = مناطق محددة مسبقاً • "
-    "Click on the coastline — blue markers = pre-mapped zones"
-)
+st.title("🌊 المحلل الهيدروديناميكي العسكري للصيد v5.0")
+st.markdown("#### **محرك فيزيائي حقيقي + 3 أيام + مقارنة موقعين + نماذج السحب والتيارات**")
 
-_m = folium.Map(
-    location=[st.session_state.lat, st.session_state.lon],
-    zoom_start=9,
-    tiles="CartoDB positron",
-    control_scale=True,
-)
+# ==========================================
+# HELPER: HAVERSINE
+# ==========================================
+def destination_point(lat1, lon1, bearing_deg, distance_km):
+    R = 6371.0
+    bearing = math.radians(bearing_deg)
+    lat1_r = math.radians(lat1)
+    lon1_r = math.radians(lon1)
+    lat2_r = math.asin(
+        math.sin(lat1_r) * math.cos(distance_km / R) +
+        math.cos(lat1_r) * math.sin(distance_km / R) * math.cos(bearing)
+    )
+    lon2_r = lon1_r + math.atan2(
+        math.sin(bearing) * math.sin(distance_km / R) * math.cos(lat1_r),
+        math.cos(distance_km / R) - math.sin(lat1_r) * math.sin(lat2_r)
+    )
+    return math.degrees(lat2_r), math.degrees(lon2_r)
 
-# Current-selection anchor marker
-folium.Marker(
-    location=[st.session_state.lat, st.session_state.lon],
-    popup=folium.Popup(
-        f"<b>📍 نقطة الصيد المختارة</b><br>"
-        f"Lat: {st.session_state.lat:.5f}<br>"
-        f"Lon: {st.session_state.lon:.5f}",
-        max_width=240,
-    ),
-    tooltip="نقطتك الحالية",
-    icon=folium.Icon(color="red", icon="anchor", prefix="fa"),
-).add_to(_m)
+def classify_score(score):
+    if score >= 7.5:
+        return "🟢 ممتاز (GO+)", "go-excellent", "GO"
+    elif score >= 5.0:
+        return "🟡 ممكن (GO)", "go-good", "GO"
+    elif score >= 4.0:
+        return "🟠 تحذير", "go-warning", "WARNING"
+    else:
+        return "🔴 مستحيل (NO-GO)", "go-nogo", "NO-GO"
 
-# Plot all known coastal zones as clickable circles
-_ZONE_CENTERS = {
-    "الرتيبة":       (36.45, 10.72),
-    "سيدي محرصي":    (36.62, 10.80),
-    "كركوان":        (36.88, 11.05),
-    "نابل":          (36.47, 10.74),
-    "قربة":          (36.61, 10.87),
-    "الحمامات ج":    (36.39, 10.62),
-    "بنزرت":         (37.28, 9.87),
-    "رأس الطيب":     (37.12, 11.08),
-    "سوسة":          (35.83, 10.63),
-    "المهدية":       (35.50, 11.05),
-    "جربة ش":        (33.90, 10.97),
-    "زارزيس":        (33.55, 11.22),
-}
-for _zname, (_zlat, _zlon) in _ZONE_CENTERS.items():
-    folium.CircleMarker(
-        location=[_zlat, _zlon],
-        radius=8, color="#0288d1",
-        fill=True, fill_color="#0288d1", fill_opacity=0.65,
-        tooltip=_zname,
-    ).add_to(_m)
-
-_map_out = st_folium(
-    _m, width="100%", height=480,
-    returned_objects=["last_clicked"],
-    key="map_main",
-)
-
-# BUG FIX: rerun ONLY when coords genuinely change — eliminates render loops
-if _map_out and _map_out.get("last_clicked"):
-    _nc = _map_out["last_clicked"]
-    _nlat = round(float(_nc["lat"]), 6)
-    _nlon = round(float(_nc["lng"]), 6)
-    if _nlat != st.session_state.lat or _nlon != st.session_state.lon:
-        st.session_state.lat      = _nlat
-        st.session_state.lon      = _nlon
-        st.session_state.data_ready   = False
-        st.session_state.scores       = None
-        st.session_state.gemini_report = None
-        st.rerun()
-
-# Coordinate display
-_c1, _c2, _c3 = st.columns(3)
-_c1.metric("🌐 خط العرض / Latitude",  f"{st.session_state.lat:.6f}°")
-_c2.metric("🌐 خط الطول / Longitude", f"{st.session_state.lon:.6f}°")
-
-# Zone detection — instant, no API call
-_active_zone = get_coastal_zone(st.session_state.lat, st.session_state.lon)
-st.session_state.zone = _active_zone
-_c3.metric("📍 المنطقة / Zone", _active_zone.get("name_ar", "N/A")[:28])
-
-# Zone information card (RTL)
-st.markdown(f"""
-<div class="zone-card">
-  <b>🗺️ المنطقة الساحلية المكتشفة:</b> {_active_zone.get("name_ar","—")}
-  &nbsp;|&nbsp; {_active_zone.get("name_fr","—")}<br>
-  <b>📐 اتجاه العمود على الشاطئ (Normal):</b>
-  {_active_zone.get("normal", 90.0):.1f}°
-  &nbsp;|&nbsp;
-  <b>🌊 القاع:</b> {_active_zone.get("depth_profile","—")}<br>
-  <b>🐟 الأسماك المستهدفة:</b> {_active_zone.get("target_species","—")}<br>
-  <b>💨 ملاحظات الريح المحلية:</b>
-  <span class="rtl">{_active_zone.get("wind_notes","—")}</span>
-</div>
-""", unsafe_allow_html=True)
-
-st.markdown("---")
-
-# =============================================================================
-# 7. API FETCHING FUNCTIONS — Parameterized dict, no f-string URL building
-# =============================================================================
-
-def fetch_marine(lat: float, lon: float) -> dict:
+# ==========================================
+# ADVANCED PHYSICS MODELS (TRUE HYDRODYNAMICS)
+# ==========================================
+def calculate_longshore_current(wave_height, wave_period, wave_impact_angle_deg):
     """
-    BUG FIX #2 params dict pattern.
-    BUG FIX #9 timezone forced to UTC.
+    حساب سرعة التيار الموازي للشاطئ (Longshore Current)
+    V = (g × T × H² × sin(2θ)) / (16 × d)
     """
-    params = {
-        "latitude":      lat,
-        "longitude":     lon,
-        "hourly":        "wave_height,wave_period,wave_direction",
-        "past_days":     PAST_DAYS,
-        "forecast_days": FORECAST_DAYS,
-        "timezone":      TIMEZONE,
+    if wave_height < 0.1 or wave_period < 1.0:
+        return 0.0
+    
+    g = 9.81
+    theta_rad = math.radians(wave_impact_angle_deg)
+    d = 1.3 * wave_height
+    
+    if d < 0.1:
+        d = 0.1    
+    v_longshore = (g * wave_period * (wave_height ** 2) * math.sin(2 * theta_rad)) / (16 * d)
+    return abs(v_longshore)
+
+def calculate_lead_drag_force(current_velocity_ms, lead_weight_g=120, lead_type="pyramid"):
+    """
+    حساب قوة السحب على الرصاصة ومقارنتها بقوة التثبيت
+    F_drag = 0.5 × ρ × Cd × A × V²
+    """
+    g = 9.81
+    rho = 1025  # كثافة مياه البحر (كغ/م³)
+    
+    cd_values = {
+        "pyramid": 0.30,
+        "grippo": 0.35,
+        "spider": 0.40,
+        "olive": 0.50,
+        "ball": 0.47
     }
-    r = requests.get(MARINE_API_BASE, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    if "hourly" not in data:
-        raise ValueError(f"No 'hourly' block. Keys: {list(data.keys())}")
-    return data["hourly"]
-
-
-def fetch_weather(lat: float, lon: float) -> dict:
-    """
-    BUG FIX #9 timezone forced UTC — same as marine to prevent array drift.
-    """
-    params = {
-        "latitude":        lat,
-        "longitude":       lon,
-        "hourly":          "wind_speed_10m,wind_direction_10m",
-        "past_days":       PAST_DAYS,
-        "forecast_days":   FORECAST_DAYS,
-        "timezone":        TIMEZONE,
-        "wind_speed_unit": "kmh",
+    cd = cd_values.get(lead_type, 0.45)
+    
+    lead_volume = (lead_weight_g / 1000) / 11340  # كثافة الرصاص
+    lead_radius = ((3 * lead_volume) / (4 * math.pi)) ** (1/3)
+    cross_section_area = math.pi * (lead_radius ** 2)
+    
+    f_drag = 0.5 * rho * cd * cross_section_area * (current_velocity_ms ** 2)
+    
+    lead_mass_kg = lead_weight_g / 1000
+    f_grip = lead_mass_kg * g * 0.6  # معامل احتكاك الرمل
+    
+    drift_ratio = f_drag / f_grip if f_grip > 0 else 999
+    
+    return {
+        "drag_force_n": round(f_drag, 3),
+        "grip_force_n": round(f_grip, 3),
+        "drift_ratio": round(drift_ratio, 2),
+        "will_drift": drift_ratio > 0.8
     }
-    r = requests.get(WEATHER_API_BASE, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    if "hourly" not in data:
-        raise ValueError("No 'hourly' block in weather response.")
-    return data["hourly"]
 
+def calculate_rip_current_risk(wave_height, wave_period, shoreline_normal, wave_direction, fetch_coverage):
+    """مؤشر خطر التيارات الساحبة (Rip Currents)"""
+    risk_score = 0.0
+    
+    if wave_height > 1.0 and wave_period > 7.0:
+        risk_score += 2.0
+    
+    if shoreline_normal is not None:
+        wave_impact = abs(wave_direction - shoreline_normal)
+        if wave_impact > 180:
+            wave_impact = 360 - wave_impact        
+        if wave_impact < 20 and fetch_coverage > 0.6:
+            risk_score += 1.5
+    
+    if risk_score >= 3.0:
+        return "عالي الخطورة", risk_score
+    elif risk_score >= 1.5:
+        return "متوسط", risk_score
+    else:
+        return "منخفض", risk_score
 
-def jonswap_fallback_marine(n: int, wind_data: dict) -> dict:
-    """
-    BUG FIX #7: Physics-based JONSWAP approximation replaces flat 0.45m array.
-    Hs ≈ 0.0016 * (U²*F/g)^0.5  simplified for Mediterranean fetch ~50 km.
-    Wave direction follows wind direction (same source).
-    """
-    fetch_m   = 50_000.0   # 50 km representative Mediterranean fetch
-    g         = 9.81
-    speeds    = wind_data.get("wind_speed_10m",    [10.0] * n)
-    wdirs     = wind_data.get("wind_direction_10m", [50.0] * n)
-    heights, periods, wave_dirs = [], [], []
+def calculate_surface_debris_index(wind_speed, wind_direction_going_to, shoreline_normal, is_historically_dirty):
+    """مؤشر نقل الأعشاب السطحية"""
+    debris_score = 0.0
+    
+    if shoreline_normal is not None:
+        wind_to_shore = abs(wind_direction_going_to - shoreline_normal)
+        if wind_to_shore > 180:
+            wind_to_shore = 360 - wind_to_shore
+        
+        if wind_to_shore < 30 and wind_speed > 15:
+            debris_score += 2.0
+        elif wind_to_shore < 60 and wind_speed > 20:
+            debris_score += 1.5
+    
+    if is_historically_dirty:
+        debris_score += 2.0
+    
+    if wind_speed > 25:
+        debris_score += 1.0
+    
+    if debris_score >= 4.0:
+        return "كثيف جداً", debris_score
+    elif debris_score >= 2.5:
+        return "متوسط", debris_score
+    elif debris_score >= 1.0:
+        return "خفيف", debris_score
+    else:
+        return "نظيف", debris_score
 
-    for i in range(n):
-        u_kmh = float(speeds[i]) if speeds[i] is not None else 10.0
-        u_ms  = u_kmh / 3.6
-        # JONSWAP significant wave height (simplified, no depth correction)
-        hs = 0.0016 * math.sqrt(u_ms ** 2 * fetch_m / g)
-        hs = round(max(0.05, min(hs, 2.5)), 3)
-        # Peak period from JONSWAP dispersion
-        tp = 0.286 * math.sqrt(fetch_m / g) * (u_ms ** (1 / 3)) if u_ms > 0 else 4.0
-        tp = round(max(3.0, min(tp, 12.0)), 3)
-        # Wave direction = wind direction (wind-driven seas)
-        wd = float(wdirs[i]) if wdirs[i] is not None else 50.0
-        heights.append(hs)
-        periods.append(tp)
-        wave_dirs.append(round(wd, 2))
+def recommend_lead_weight(current_velocity_ms, wave_height, lead_type="pyramid"):
+    """توصية بوزن الرصاصة المطلوب لتثبيت المونتاج"""
+    cd_values = {"pyramid": 0.30, "grippo": 0.35, "spider": 0.40, "olive": 0.50, "ball": 0.47}
+    cd = cd_values.get(lead_type, 0.45)
+    g = 9.81
+    rho = 1025
+    friction_coef = 0.6
+    
+    # وزن أساسي يعتمد على سرعة التيار
+    if current_velocity_ms < 0.3:        base_weight = 80
+    elif current_velocity_ms < 0.6:
+        base_weight = 100
+    elif current_velocity_ms < 1.0:
+        base_weight = 125
+    elif current_velocity_ms < 1.5:
+        base_weight = 150
+    else:
+        base_weight = 175
+    
+    # تعديل حسب ارتفاع الموج
+    if wave_height > 1.2:
+        base_weight += 25
+    elif wave_height > 0.8:
+        base_weight += 15
+    
+    # تعديل حسب نوع الرصاصة (الهرمي يحتاج وزن أقل)
+    if lead_type == "pyramid":
+        base_weight -= 10
+    elif lead_type == "ball":
+        base_weight += 20
+    
+    return max(80, min(200, base_weight))
 
-    return {"wave_height": heights, "wave_period": periods, "wave_direction": wave_dirs}
+# ==========================================
+# SHORELINE ASPECT CALCULATOR
+# ==========================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def calculate_shoreline_aspect(lat, lon):
+    try:
+        radius_km = 2.0
+        points = []
+        for bearing in range(0, 360, 10):
+            lat2, lon2 = destination_point(lat, lon, bearing, radius_km)
+            points.append({"lat": round(lat2, 5), "lon": round(lon2, 5), "bearing": bearing})
+        
+        lats_str = ",".join([str(p["lat"]) for p in points])
+        lons_str = ",".join([str(p["lon"]) for p in points])
+        
+        resp = requests.get(
+            "https://api.open-meteo.com/v1/elevation",
+            params={"latitude": lats_str, "longitude": lons_str},
+            timeout=10
+        )
+        resp.raise_for_status()
+        elevations = resp.json().get("elevation", [])
+        
+        if len(elevations) != len(points):
+            return None, None, "unknown", "بيانات غير مكتملة"
+                sea_bearings = []
+        for p, elev in zip(points, elevations):
+            if elev is None:
+                continue
+            if elev <= 0.5:
+                sea_bearings.append(p["bearing"])
+        
+        if not sea_bearings:
+            return None, None, "inland", "إحداثيات برية"
+        
+        sea_radians = [math.radians(b) for b in sea_bearings]
+        avg_sin = sum(math.sin(r) for r in sea_radians) / len(sea_radians)
+        avg_cos = sum(math.cos(r) for r in sea_radians) / len(sea_radians)
+        shoreline_normal = math.degrees(math.atan2(avg_sin, avg_cos)) % 360
+        
+        fetch_coverage = len(sea_bearings) / 36.0
+        
+        if fetch_coverage >= 0.65:
+            bay_type = "exposed"
+        elif fetch_coverage >= 0.35:
+            bay_type = "semi_sheltered"
+        else:
+            bay_type = "sheltered"
+        
+        return shoreline_normal, fetch_coverage, bay_type, None
+    except Exception as e:
+        return None, None, "unknown", str(e)
 
+# ==========================================
+# REVERSE GEOCODING
+# ==========================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_location_name(lat, lon):
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json", "accept-language": "ar", "zoom": 10},
+            headers={"User-Agent": "TunisianSurfcastingAdvisor/5.0"},
+            timeout=8
+        )
+        data = resp.json()
+        address = data.get("address", {})
+        name = (
+            address.get("hamlet") or address.get("village") or
+            address.get("town") or address.get("city") or
+            address.get("state") or "ساحل تونسي"
+        )
+        region = address.get("state", "")
+        return f"{name}، {region}" if region and name != region else name
+    except Exception:        return "منطقة ساحلية"
 
-def find_tomorrow_start_index(time_array: list[str]) -> int:
-    """
-    BUG FIX #1: Parse actual ISO timestamps to locate tomorrow 00:00 UTC.
-    Eliminates the hardcoded index-48 assumption that returned today's hours.
-    """
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
-    for idx, ts in enumerate(time_array):
-        try:
-            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            if dt.date() == tomorrow and dt.hour == 0:
-                return idx
-        except (ValueError, TypeError):
+# ==========================================
+# DATA FETCHING
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_marine_weather(lat, lon):
+    marine_params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": "wave_height,wave_direction,wave_period",
+        "past_days": 2, "forecast_days": 5, "timezone": "auto"
+    }
+    weather_params = {
+        "latitude": lat, "longitude": lon,
+        "hourly": "wind_speed_10m,wind_direction_10m",
+        "past_days": 2, "forecast_days": 5, "timezone": "auto"
+    }
+    
+    is_inland = False
+    marine_data = None
+    
+    try:
+        resp = requests.get("https://marine-api.open-meteo.com/v1/marine", params=marine_params, timeout=12)
+        resp.raise_for_status()
+        marine_data = resp.json()
+        if "error" in marine_data:
+            raise ValueError(marine_data.get("reason", "Error"))
+    except Exception:
+        is_inland = True
+    
+    try:
+        resp = requests.get("https://api.open-meteo.com/v1/forecast", params=weather_params, timeout=12)
+        resp.raise_for_status()
+        weather_data = resp.json()
+    except Exception as e:
+        return None, None, True, f"فشل جلب الطقس: {e}"
+    
+    return marine_data, weather_data, is_inland, None
+
+# ==========================================
+# 3-DAY PHYSICS ENGINE
+# ==========================================
+def compute_3day_scores(marine_data, weather_data, is_inland, shoreline_normal, bay_type, fetch_coverage):
+    time_array = weather_data['hourly']['time']
+    wind_speed = weather_data['hourly']['wind_speed_10m']
+    wind_dir_raw = weather_data['hourly']['wind_direction_10m']
+    
+    time_dt = []
+    for t in time_array:
+        try:            time_dt.append(datetime.fromisoformat(t))
+        except Exception:
+            time_dt.append(None)
+    
+    if not is_inland and marine_data:
+        wave_height = marine_data['hourly']['wave_height']
+        wave_dir = marine_data['hourly']['wave_direction']
+        wave_period = marine_data['hourly']['wave_period']
+    else:
+        n = len(wind_speed)
+        wave_height = [0.0] * n
+        wave_dir = [0.0] * n
+        wave_period = [0.0] * n
+    
+    valid_times = [(i, t) for i, t in enumerate(time_dt) if t is not None]
+    if not valid_times:
+        return None, "فشل تحليل الزمن"
+    
+    first_date = valid_times[0][1].date()
+    days_data = {}
+    
+    for day_offset in range(3):
+        target_date = first_date + timedelta(days=day_offset)
+        day_indices = [i for i, t in valid_times if t.date() == target_date]
+        if not day_indices:
             continue
-    # Arithmetic fallback: PAST_DAYS*24 + 24 = 72 for past_days=2, forecast_days=3
-    return PAST_DAYS * 24 + 24
-
-
-def fmt_ts(ts: str) -> str:
-    """
-    BUG FIX #12: Robust ISO timestamp formatter replacing the fragile [-8:-3] slice.
-    Returns 'DD/MM HH:MM' in UTC for unambiguous display.
-    """
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        return dt.strftime("%d/%m %H:%M")
-    except (ValueError, TypeError):
-        return str(ts)
-
-
-def null_safe(val, fallback: float) -> float:
-    """Coerce None / NaN API values to a safe numeric fallback."""
-    if val is None:
-        return fallback
-    try:
-        f = float(val)
-        return fallback if math.isnan(f) else f
-    except (TypeError, ValueError):
-        return fallback
-
-
-# =============================================================================
-# 8. FETCH + SCORE TRIGGER
-# =============================================================================
-st.subheader("🌊 جلب وتحليل البيانات / Fetch & Analyze")
-_btn = st.button(
-    "🔍 ابدأ التحليل الهيدروديناميكي / Start Analysis",
-    type="primary", use_container_width=True,
-)
-
-if _btn:
-    st.session_state.data_ready    = False
-    st.session_state.is_inland     = False
-    st.session_state.gemini_report = None
-
-    # ── 8a. Weather (always exists) ──────────────────────────────────────────
-    with st.spinner("📡 جلب بيانات الرياح..."):
-        try:
-            wx = fetch_weather(st.session_state.lat, st.session_state.lon)
-        except Exception as e:
-            st.error(f"❌ فشل API الطقس: `{e}`")
-            st.stop()
-
-    n_total = len(wx.get("wind_speed_10m", []))
-
-    # ── 8b. Marine (with inland graceful fallback) ───────────────────────────
-    with st.spinner("🌊 جلب بيانات الأمواج..."):
-        try:
-            mx = fetch_marine(st.session_state.lat, st.session_state.lon)
-        except Exception as marine_err:
-            st.session_state.is_inland = True
-            mx = jonswap_fallback_marine(n_total, wx)  # BUG FIX #7
-            st.warning(
-                "⚠️ **المنطقة المختارة خارج نطاق Marine API — محاكاة JONSWAP مفعّلة**\n\n"
-                "تم توليد بيانات الأمواج رياضياً من بيانات الريح باستخدام معادلة JONSWAP "
-                "المبسّطة (fetch = 50 كم). هذه تقديرات فيزيائية، وليست قياسات حقيقية. "
-                "يُنصح باختيار نقطة ساحلية مسجّلة لتحليل دقيق.\n\n"
-                f"*Technical: `{str(marine_err)[:100]}`*"
+        
+        start_idx = day_indices[0]
+        end_idx = day_indices[-1] + 1
+        
+        past_end = start_idx
+        past_start = max(0, past_end - 48)
+        
+        past_wh = [x for x in wave_height[past_start:past_end] if x is not None]
+        past_wp = [x for x in wave_period[past_start:past_end] if x is not None]
+        
+        avg_past_wh = sum(past_wh) / max(1, len(past_wh)) if past_wh else 0
+        avg_past_wp = sum(past_wp) / max(1, len(past_wp)) if past_wp else 0
+        is_dirty = (avg_past_wh > 1.2) and (avg_past_wp > 8.0)
+        
+        hourly = []
+        for i in range(start_idx, end_idx):
+            score = 10.0
+            
+            wh = wave_height[i] if i < len(wave_height) and wave_height[i] is not None else 0.0
+            wd = wave_dir[i] if i < len(wave_dir) and wave_dir[i] is not None else 0.0
+            wp = wave_period[i] if i < len(wave_period) and wave_period[i] is not None else 0.0
+            ws_raw = wind_speed[i] if i < len(wind_speed) and wind_speed[i] is not None else 0.0
+            wdir_raw = wind_dir_raw[i] if i < len(wind_dir_raw) and wind_dir_raw[i] is not None else 0.0
+            time_str = time_array[i]            
+            wdir_going_to = (wdir_raw + 180) % 360
+            
+            # احتكاك اليابسة
+            ws_effective = ws_raw
+            wind_land_factor = 1.0
+            if shoreline_normal is not None:
+                wind_to_shore_angle = abs(wdir_going_to - shoreline_normal)
+                if wind_to_shore_angle > 180:
+                    wind_to_shore_angle = 360 - wind_to_shore_angle
+                
+                if wind_to_shore_angle > 90:
+                    wind_land_factor = 0.4
+                    ws_effective = ws_raw * 0.4
+                elif wind_to_shore_angle > 60:
+                    wind_land_factor = 0.75
+                    ws_effective = ws_raw * 0.75
+            
+            # معامل الخليج
+            bay_wave_factor = 1.0
+            if bay_type == "sheltered":
+                bay_wave_factor = 0.5
+            elif bay_type == "semi_sheltered":
+                bay_wave_factor = 0.75
+            
+            wh_eff = wh * bay_wave_factor
+            
+            # زاوية اصطدام الموج
+            if shoreline_normal is not None:
+                wave_impact = abs(wd - shoreline_normal)
+                if wave_impact > 180:
+                    wave_impact = 360 - wave_impact
+            else:
+                wave_impact = 0
+            
+            wind_wave_angle = abs(wdir_going_to - wd)
+            if wind_wave_angle > 180:
+                wind_wave_angle = 360 - wind_wave_angle
+            
+            is_wave_frontal = wave_impact <= 25
+            is_wave_lateral = 30 < wave_impact < 150
+            is_wind_aligned = wind_wave_angle <= 25 or wind_wave_angle >= 155
+            
+            # ====== النماذج الفيزيائية الحقيقية ======
+            v_longshore = calculate_longshore_current(wh_eff, wp, wave_impact)
+            v_longshore_kmh = v_longshore * 3.6
+            
+            lead_analysis = calculate_lead_drag_force(v_longshore, 120, "pyramid")
+            recommended_weight = recommend_lead_weight(v_longshore, wh_eff, "pyramid")
+                        rip_risk, rip_score = calculate_rip_current_risk(
+                wh, wp, shoreline_normal, wd,
+                fetch_coverage if fetch_coverage else 0.5
             )
+            
+            debris_status, debris_score_val = calculate_surface_debris_index(
+                ws_effective, wdir_going_to, shoreline_normal, is_dirty
+            )
+            
+            # ====== العقوبات الأساسية ======
+            if wh_eff < 0.3:
+                score -= 3.0
+            
+            is_weedy = (wh_eff > 1.2 and wp > 8.0)
+            if is_weedy or is_dirty:
+                score -= 4.5
+            
+            # ====== عقوبات النماذج الفيزيائية ======
+            if v_longshore_kmh > 1.5:
+                score -= 3.0
+            elif v_longshore_kmh > 0.8:
+                score -= 1.5
+            
+            if lead_analysis["will_drift"]:
+                score -= 2.5
+            
+            if rip_risk == "عالي الخطورة":
+                score -= 3.0
+            elif rip_risk == "متوسط":
+                score -= 1.5
+            
+            if debris_status == "كثيف جداً":
+                score -= 2.0
+            elif debris_status == "متوسط":
+                score -= 1.0
+            
+            # ====== المكافآت ======
+            if (0.5 <= wh_eff <= 1.2 and ws_effective > 12.0 and
+                is_wind_aligned and is_wave_frontal and wind_land_factor >= 0.75):
+                score += 1.5
+            
+            is_cleansing = (4.0 <= wp <= 7.0 and wh_eff > 0.5 and
+                          is_wind_aligned and is_dirty and is_wave_frontal)
+            if is_cleansing:
+                score += 2.0
+                if is_dirty and not is_weedy:
+                    score += 4.5
+            
+            score = max(0.0, min(10.0, score))
+                        hourly.append({
+                "time": time_str,
+                "score": round(score, 1),
+                "wh": round(wh_eff, 2),
+                "wp": round(wp, 1),
+                "ws": round(ws_effective, 1),
+                "impact": round(wave_impact, 1),
+                "longshore_ms": round(v_longshore, 2),
+                "longshore_kmh": round(v_longshore_kmh, 1),
+                "lead_drag_n": lead_analysis["drag_force_n"],
+                "lead_drift": lead_analysis["will_drift"],
+                "lead_recommended_g": recommended_weight,
+                "rip_risk": rip_risk,
+                "debris": debris_status
+            })
+        
+        avg_score = sum(h["score"] for h in hourly) / len(hourly) if hourly else 0
+        confidence = ["🟢 عالية (90%+)", "🟡 عالية-متوسطة (80%+)", "🟠 متوسطة (65%+)"][day_offset]
+        
+        days_data[target_date.isoformat()] = {
+            "hourly": hourly,
+            "avg_score": round(avg_score, 1),
+            "is_dirty": is_dirty,
+            "avg_past_wh": round(avg_past_wh, 2),
+            "avg_past_wp": round(avg_past_wp, 1),
+            "confidence": confidence,
+            "day_offset": day_offset
+        }
+    
+    return days_data, None
 
-    # ── 8c. Array alignment & null-safety ────────────────────────────────────
-    ts_arr  = wx.get("time",                [f"T{i}" for i in range(n_total)])
-    wh_arr  = [null_safe(v, 0.30)  for v in mx.get("wave_height",    [])]
-    wp_arr  = [null_safe(v, 5.50)  for v in mx.get("wave_period",    [])]
-    wdv_arr = [null_safe(v, 0.00)  for v in mx.get("wave_direction", [])]
-    wsp_arr = [null_safe(v, 0.00)  for v in wx.get("wind_speed_10m", [])]
-    wdr_arr = [null_safe(v, 0.00)  for v in wx.get("wind_direction_10m", [])]
+# ==========================================
+# GEMINI REPORT
+# ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def generate_gemini_report(days_a, days_b, info_a, info_b, compare_mode):
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None, "GEMINI_API_KEY مفقود"
+    
+    try:
+        genai.configure(api_key=api_key)
+        config = genai.GenerationConfig(temperature=0.1, top_p=0.1, max_output_tokens=3500)
+        model = genai.GenerativeModel('gemini-1.5-flash', generation_config=config)
+        
+        bay_ar = {"exposed": "مكشوف", "semi_sheltered": "شبه محمي", "sheltered": "محمي"}
+        
+        payload = {
+            "location_a": {
+                "name": info_a["name"],                "bay": bay_ar.get(info_a["bay_type"], info_a["bay_type"]),
+                "shoreline_normal": round(info_a["shoreline_normal"], 1) if info_a["shoreline_normal"] else None,
+                "days": days_a
+            }
+        }
+        
+        if compare_mode and days_b:
+            payload["location_b"] = {
+                "name": info_b["name"],
+                "bay": bay_ar.get(info_b["bay_type"], info_b["bay_type"]),
+                "shoreline_normal": round(info_b["shoreline_normal"], 1) if info_b["shoreline_normal"] else None,
+                "days": days_b
+            }
+        
+        json_str = json.dumps(payload, ensure_ascii=False)
+        
+        comparison_part = ""
+        if compare_mode and days_b:
+            comparison_part = """
+## ⚖️ المقارنة التكتيكية بين الموقعين (3 أيام)
+(قارن فيزيائياً: أيهما أقل تيار موازي؟ أيهما أقل انجراف رصاص؟ أيهما أنظف من الأعشاب؟)
 
-    n = min(len(ts_arr), len(wh_arr), len(wp_arr),
-            len(wdv_arr), len(wsp_arr), len(wdr_arr))
-
-    if n < HISTORY_HOURS + 1:
-        st.error(
-            f"❌ بيانات غير كافية ({n} نقطة، مطلوب {HISTORY_HOURS + 1}). "
-            "حاول لاحقاً أو غيّر الموقع."
-        )
-        st.stop()
-
-    ts_arr  = ts_arr[:n];  wh_arr  = wh_arr[:n];  wp_arr  = wp_arr[:n]
-    wdv_arr = wdv_arr[:n]; wsp_arr = wsp_arr[:n]; wdr_arr = wdr_arr[:n]
-
-    # ── 8d. Historical baseline (past 48 h) ──────────────────────────────────
-    past_wh = wh_arr[:HISTORY_HOURS]
-    past_wp = wp_arr[:HISTORY_HOURS]
-    avg_past_h = sum(past_wh) / len(past_wh)
-    avg_past_t = sum(past_wp) / len(past_wp)
-    sea_dirty  = (avg_past_h > WEED_MIN_H and avg_past_t > WEED_MIN_T)
-    st.session_state.sea_dirty  = sea_dirty
-    st.session_state.past_avg_h = avg_past_h
-    st.session_state.past_avg_t = avg_past_t
-
-    # ── 8e. BUG FIX #1 — Locate tomorrow's real start index ─────────────────
-    tomorrow_idx = find_tomorrow_start_index(ts_arr)
-    tomorrow_end = min(tomorrow_idx + 24, n)   # analyse exactly 24 h of tomorrow
-
-    if tomorrow_idx >= n:
-        st.error(
-            "❌ لا توجد بيانات ليوم الغد في النافذة الزمنية المسترجعة. "
-            "تحقق من إعدادات forecast_days."
-        )
-        st.stop()
-
-    # ── 8f. Shoreline normal for this zone ───────────────────────────────────
-    shore_normal = _active_zone.get("normal", 90.0)
-
-    # ── 8g. Hourly Fishing Score Engine (tomorrow only) ──────────────────────
-    scores: list[dict] = []
-
-    for i in range(tomorrow_idx, tomorrow_end):
-        h   = wh_arr[i]    # wave height (m)
-        p   = wp_arr[i]    # wave period (s)
-        wdv = wdv_arr[i]   # wave direction TO (°) — Open-Meteo "direction of travel"
-        spd = wsp_arr[i]   # wind speed (km/h)
-        wnd = wdr_arr[i]   # wind direction FROM (°) — meteorological convention
-        ts  = ts_arr[i]
-
-        score = SCORE_BASELINE   # 10.0
-
-        # ── RULE 1: Dead Sea Penalty ─────────────────────────────────────────
-        dead_sea = (h < DEAD_SEA_MAX_H)
-        if dead_sea:
-            score -= DEAD_SEA_PENALTY
-
-        # ── RULE 2: Weed Penalty with temporal decay ─────────────────────────
-        # BUG FIX #4: baseline dirty effect decays linearly over 24 h
-        # BUG FIX #5: mutually exclusive with dead_sea (0.3m can't suspend weed)
-        currently_rough = (h > WEED_MIN_H and p > WEED_MIN_T)
-        weed_active = False
-        if not dead_sea:
-            hours_since_history = i - HISTORY_HOURS
-            dirty_decay = max(0.0, 1.0 - (hours_since_history / DIRTY_DECAY_HOURS))
-            if currently_rough:
-                score -= WEED_PENALTY
-                weed_active = True
-            elif sea_dirty and dirty_decay > 0.0:
-                score -= WEED_PENALTY * dirty_decay
-                weed_active = True
-
-        # ── RULE 3 & BUG FIX #2: Unified FROM convention ────────────────────
-        # wave_direction in Open-Meteo = direction waves are TRAVELLING TO
-        # Convert to FROM convention to match wind_direction_10m (also FROM)
-        wave_from = (wdv + 180.0) % 360.0
-
-        # Circular boundary fix (prevents 359°-1° = 358° ghost)
-        raw_diff = abs(wnd - wave_from)
-        wave_wind_diff = 360.0 - raw_diff if raw_diff > 180.0 else raw_diff
-
-        # ── RULE 3 & BUG FIX #3: Wind vs SHORELINE normal (not wave dir) ────
-        raw_shore_diff = abs(wnd - shore_normal)
-        wind_vs_shore  = 360.0 - raw_shore_diff if raw_shore_diff > 180.0 else raw_shore_diff
-        # 0° = wind blowing straight onshore (وش) → perpendicular, ideal
-        # 90° = wind parallel to coast → fully lateral, dangerous
-
-        is_lateral     = LATERAL_ANGLE_LOW < wind_vs_shore < LATERAL_ANGLE_HIGH
-        is_perpendicular = not is_lateral
-
-        # ── RULE 4: Lateral Drift Penalty ('تيار الحمل') ─────────────────────
-        if is_lateral:
-            if spd > LATERAL_STRONG_SPD:
-                score -= LATERAL_STRONG_PEN   # lead loses traction entirely
-            elif spd > LATERAL_MOD_SPD:
-                score -= LATERAL_MOD_PEN      # moderate drift
-
-        # ── RULE 5: White Foam Belt Bonus ('Écume / الرغوة') ─────────────────
-        foam_bonus_applied = False
-        if (FOAM_MIN_H <= h <= FOAM_MAX_H and
-                spd > FOAM_MIN_SPD and is_perpendicular):
-            score += FOAM_BONUS
-            foam_bonus_applied = True
-
-        # ── RULE 6: Wave Sieve Cleansing Bonus ('الموج ينظف نفسه') ──────────
-        # BUG FIX #6: applies whenever sea was dirty AND sieve conditions met,
-        # regardless of foam (separate phenomenon)
-        sieve_bonus_applied = False
-        if (SIEVE_MIN_T <= p <= SIEVE_MAX_T and
-                h > SIEVE_MIN_H and
-                is_perpendicular and
-                sea_dirty):
-            score += SIEVE_BONUS
-            sieve_bonus_applied = True
-
-        # ── Clamp ────────────────────────────────────────────────────────────
-        score = round(max(SCORE_MIN, min(SCORE_MAX, score)), 2)
-
-        scores.append({
-            "time":               ts,
-            "time_fmt":           fmt_ts(ts),     # BUG FIX #12
-            "fishing_score":      score,
-            "wave_height_m":      round(h,   3),
-            "wave_period_s":      round(p,   3),
-            "wave_dir_to_deg":    round(wdv, 2),
-            "wave_dir_from_deg":  round(wave_from, 2),
-            "wind_speed_kmh":     round(spd, 2),
-            "wind_dir_from_deg":  round(wnd, 2),
-            "wind_vs_shore_deg":  round(wind_vs_shore, 2),
-            "wave_wind_diff_deg": round(wave_wind_diff, 2),
-            "shore_normal_deg":   shore_normal,
-            "is_lateral":         is_lateral,
-            "is_perpendicular":   is_perpendicular,
-            "dead_sea":           dead_sea,
-            "weed_active":        weed_active,
-            "currently_rough":    currently_rough,
-            "foam_bonus":         foam_bonus_applied,
-            "sieve_bonus":        sieve_bonus_applied,
-            "sea_baseline_dirty": sea_dirty,
-        })
-
-    # ── 8h. Aggregate statistics ──────────────────────────────────────────────
-    avg_score = round(sum(r["fishing_score"] for r in scores) / len(scores), 2) if scores else 0.0
-    max_score = max((r["fishing_score"] for r in scores), default=0.0)
-    best_hour = next((r["time_fmt"] for r in scores if r["fishing_score"] == max_score), "N/A")
-    go_hours  = sum(1 for r in scores if r["fishing_score"] >= GO_MIN_AVG)
-
-    # BUG FIX #8: GO requires BOTH avg AND hours — AND not OR
-    if avg_score >= GO_MIN_AVG and go_hours >= GO_MIN_HOURS:
-        go_decision = "GO"
-    elif avg_score >= 4.0 or go_hours >= 4:
-        go_decision = "CONDITIONAL"
-    else:
-        go_decision = "NO-GO"
-
-    # Persist to session state
-    st.session_state.scores      = scores
-    st.session_state.avg_score   = avg_score
-    st.session_state.max_score   = max_score
-    st.session_state.best_hour   = best_hour
-    st.session_state.go_hours    = go_hours
-    st.session_state.go_decision = go_decision
-    st.session_state.data_ready  = True
-
-# =============================================================================
-# 9. RESULTS DISPLAY — only when data is ready
-# =============================================================================
-if st.session_state.data_ready and st.session_state.scores:
-    scores      = st.session_state.scores
-    avg_score   = st.session_state.avg_score
-    max_score   = st.session_state.max_score
-    best_hour   = st.session_state.best_hour
-    go_hours    = st.session_state.go_hours
-    go_decision = st.session_state.go_decision
-    sea_dirty   = st.session_state.sea_dirty
-
-    st.markdown("---")
-    st.subheader("📊 مصفوفة نقاط الصيد — 24 ساعة / 24-Hour Score Matrix")
-
-    # ── KPI row ──────────────────────────────────────────────────────────────
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("📈 المتوسط / Avg", f"{avg_score:.2f}/10")
-    k2.metric("⭐ الذروة / Peak",  f"{max_score:.2f}/10")
-    k3.metric("🕐 أفضل ساعة",     best_hour)
-    k4.metric("✅ ساعات جيدة (≥6)", f"{go_hours}/24")
-
-    _dec_color = {"GO": "🟢", "CONDITIONAL": "🟡", "NO-GO": "🔴"}
-    k5.metric("⚔️ القرار", f"{_dec_color.get(go_decision,'')} {go_decision}")
-
-    # ── Score data-table ──────────────────────────────────────────────────────
-    df = pd.DataFrame(scores)
-    df_disp = df[[
-        "time_fmt", "fishing_score", "wave_height_m", "wave_period_s",
-        "wind_speed_kmh", "wind_vs_shore_deg", "is_lateral",
-        "weed_active", "foam_bonus", "sieve_bonus",
-    ]].copy()
-    df_disp.columns = [
-        "🕐 الوقت", "🎯 النقطة", "🌊 موج(م)",
-        "⏱️ دورة(ث)", "💨 ريح(كم/س)", "📐 زاوية الشاطئ°",
-        "↔️ جانبي؟", "🌿 مدرر؟", "🌫️ رغوة+", "🧹 تنظيف+"
-    ]
-
-    def _score_style(val):
-        if isinstance(val, float):
-            if val >= 7.0: return "background:#1e8449;color:white;font-weight:bold"
-            if val >= 4.5: return "background:#b7950b;color:white;font-weight:bold"
-            return "background:#922b21;color:white;font-weight:bold"
-        return ""
-
-    # BUG FIX #10: use .map() — applymap deprecated since pandas 2.1
-    styled_df = df_disp.style.map(_score_style, subset=["🎯 النقطة"])
-    st.dataframe(styled_df, use_container_width=True, height=440)
-
-    # ── Historical baseline expander ──────────────────────────────────────────
-    with st.expander("📜 الخط الأساسي التاريخي (48 ساعة الماضية)"):
-        st.markdown(f"""
-| المؤشر | القيمة |
-|---|---|
-| متوسط ارتفاع الموج (48h) | `{st.session_state.past_avg_h:.3f} m` |
-| متوسط دورة الموج (48h)   | `{st.session_state.past_avg_t:.3f} s` |
-| حالة البحر التاريخية      | **{"🔴 مدرر — Historically Dirty" if sea_dirty else "🟢 نظيف — Clean Baseline"}** |
-| عمود الشاطئ (Shore Normal)| **{_active_zone.get("normal",90.0):.1f}°** |
-| وضع المحاكاة JONSWAP      | **{"⚠️ نعم" if st.session_state.is_inland else "✅ لا — بيانات حقيقية"}** |
-        """)
-
-    # ── Angle interpretation legend ───────────────────────────────────────────
-    with st.expander("📐 تفسير زاوية الشاطئ — Angle Interpretation Guide"):
-        st.markdown(f"""
-**اتجاه العمود على الشاطئ في منطقتك = `{_active_zone.get("normal",90.0):.1f}°`**
-
-| الزاوية (wind vs shore) | التفسير | تأثير الإثقالة |
-|---|---|---|
-| **0° – 30°** | ريح وش 🟢 — عمودية على الشاطئ | تثبت ممتاز، لا جر |
-| **30° – 150°** | ريح وس / جانبي 🟡🔴 — مائلة | الرصاصة تنزلق وترجع للشاطئ |
-| **150° – 180°** | ريح ظهري 🟡 — من خلف الصياد | يساعد الرمي لكن يضعف الاستشعار |
-
-{_active_zone.get("wind_notes", "")}
-        """)
-
-    st.markdown("---")
-
-    # =========================================================================
-    # 10. GEMINI 1.5 FLASH — Strategic Arabic Advisory
-    # =========================================================================
-    st.subheader("🤖 التقرير الاستراتيجي الكامل / Full Gemini Advisory")
-
-    _key = os.environ.get("GEMINI_API_KEY")
-    if not _key:
-        st.warning(
-            "⚠️ **GEMINI_API_KEY غير موجود**\n\n"
-            "أضف المفتاح إلى Environment Variables في Render لتفعيل التقرير الاستراتيجي."
-        )
-    else:
-        genai.configure(api_key=_key)
-        _model = genai.GenerativeModel("gemini-1.5-flash")
-
-        # Serialize the pre-computed score array as compact JSON
-        scores_json = json.dumps(scores, ensure_ascii=False, indent=2, default=str)
-
-        # Prepare a human-readable sieve hours list for Gemini
-        sieve_hours = [r["time_fmt"] for r in scores if r["sieve_bonus"]]
-        foam_hours  = [r["time_fmt"] for r in scores if r["foam_bonus"]]
-        lateral_hours = [r["time_fmt"] for r in scores if r["is_lateral"]]
-        dead_hours  = [r["time_fmt"] for r in scores if r["dead_sea"]]
-
-        # BUG FIX #8: pass pre-computed GO/NO-GO — AI only translates, never decides
+## 🏆 التوصية النهائية لكل يوم
+(الموقع الأفضل لليوم، لغداً، ولما بعد غد)
+"""
+        
         prompt = f"""
-أنت صياد شاطئ تونسي محترف (Surfcasting) ومحلل هيدروديناميكي ساحلي.
-لديك خبرة ميدانية عميقة في سواحل نابل: الرتيبة، سيدي محرصي، كركوان، قربة، نابل، الحمامات.
+أنت خبير محيطات ساحلية تونسي وصياد محترف متخصص في هيدروديناميكا Surfcasting.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 البيانات الرياضية المحسوبة نهائياً (JSON — لا تُعدّل أي رقم إطلاقاً):
-```json
-{scores_json}
+البيانات الكاملة لـ 3 أيام مع النماذج الفيزيائية الحقيقية:
+{json_str}
+
+حقول البيانات الجديدة (الحرجة):
+- longshore_ms: سرعة التيار الموازي للشاطئ (م/ث) - محسوبة بمعادلة فيزيائية
+- longshore_kmh: نفس السرعة بـ كم/س
+- lead_drag_n: قوة السحب على الرصاصة (نيوتن)
+- lead_drift: هل ستنجرف الرصاصة؟ (true/false)
+- lead_recommended_g: الوزن الموصى به للرصاص (جرام) - احترم هذا الرقم
+- rip_risk: خطر التيارات الساحبة (منخفض/متوسط/عالي الخطورة)
+- debris: كثافة الأعشاب السطحية (نظيف/خفيف/متوسط/كثيف جداً)
+
+⚠️ قواعد صارمة:
+1. ابدأ بـ # مباشرة (لا مقدمات، لا "بالتأكيد")
+2. لا تخترع أرقاماً - استخدم البيانات المرفقة فقط
+3. التصنيف: 🟢 ممتاز (≥7.5) | 🟡 ممكن (5.0-7.4) | 🟠 تحذير (4.0-4.9) | 🔴 مستحيل (<4.0)
+4. حلل "الموج ينظف نفسه" و "تيار الحمل" و "Écume" و "بحر مدرر"
+5. استخدم المصطلحات التونسية: plomb, bas de ligne, daurade, loup, marbré, ورطة، منكوس، بحر مدرر، تيار الحمل
+
+التزم بهذا القالب:
+# 🎯 التقرير الهيدروديناميكي الشامل (3 أيام)
+
+(فقرة افتتاحية عن طبيعة الأيام الثلاثة)
+
+## 📅 اليوم
+### 🌊 التحليل الحركي والفيزيائي
+(الموج، الرياح، **سرعة التيار الموازي**، **خطر التيارات الساحبة**، **كثافة الأعشاب**)
+### ⚓ سلوك الرصاصة
+(هل ستنجرف؟ ما الوزن المطلوب حسب lead_recommended_g؟)
+### 🎯 التصنيف والقرار
+(التصنيف + GO/NO-GO)
+### 🎣 التكتيك
+(نوع الرصاص، الوزن الدقيق، الطعم، مسافة الرمي)
+
+## 📅 غداً
+### 🌊 التحليل الحركي والفيزيائي
+(تحليل كامل + هل يحدث "الموج ينظف نفسه"؟)
+### ⚓ سلوك الرصاصة
+### 🎯 التصنيف والقرار
+### 🎣 التكتيك
+
+## 📅 بعد غد (مع تحذير الثقة)
+### 🌊 التحليل الحركي والفيزيائي
+### ⚓ سلوك الرصاصة
+### 🎯 التصنيف والقرار
+### 🎣 التكتيك
+
+{comparison_part if compare_mode else ""}
+
+## 📋 الملخص التنفيذي
+| اليوم | الموقع | النقاط | التيار الموازي | انجراف الرصاصة | الأعشاب | القرار |
+(املأ الجدول بدقة)
+
+## 🎯 أفضل نافذة زمنية على الإطلاق
+(أفضل يوم + ساعة + موقع مع التبرير الفيزيائي الكامل)
+"""
+        
+        response = model.generate_content(prompt)
+        return response.text, None
+    except Exception as e:
+        return None, str(e)
+
+# ==========================================
+# MAIN UI
+# ==========================================
+st.subheader("🗺️ اختر مواقع الصيد")
+
+tab_single, tab_compare = st.tabs(["📍 موقع واحد", "⚖️ مقارنة موقعين"])
+
+with tab_single:    st.session_state.compare_mode = False
+    col_map, col_info = st.columns([2, 1])
+    
+    with col_map:
+        m = folium.Map(location=[st.session_state.lat_a, st.session_state.lon_a], zoom_start=10)
+        folium.Marker(
+            [st.session_state.lat_a, st.session_state.lon_a],
+            tooltip="الموقع المستهدف",
+            icon=folium.Icon(color="red", icon="anchor", prefix="fa")
+        ).add_to(m)
+        map_data = st_folium(m, width=None, height=450, returned_objects=["last_clicked"], key="single_map")
+        
+        if map_data and map_data.get("last_clicked"):
+            new_lat = round(map_data["last_clicked"]["lat"], 4)
+            new_lon = round(map_data["last_clicked"]["lng"], 4)
+            if new_lat != st.session_state.lat_a or new_lon != st.session_state.lon_a:
+                st.session_state.lat_a = new_lat
+                st.session_state.lon_a = new_lon
+                st.rerun()
+    
+    with col_info:
+        st.metric("الإحداثيات", f"{st.session_state.lat_a}°, {st.session_state.lon_a}°")
+        name_a = get_location_name(st.session_state.lat_a, st.session_state.lon_a)
+        st.info(f"📌 **{name_a}**")
+
+with tab_compare:
+    st.session_state.compare_mode = True
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 🅰️ الموقع الأول")
+        m_a = folium.Map(location=[st.session_state.lat_a, st.session_state.lon_a], zoom_start=10)
+        folium.Marker(
+            [st.session_state.lat_a, st.session_state.lon_a],
+            tooltip="الموقع A",
+            icon=folium.Icon(color="red", icon="anchor", prefix="fa")
+        ).add_to(m_a)
+        map_a = st_folium(m_a, width=None, height=350, returned_objects=["last_clicked"], key="map_a")
+        if map_a and map_a.get("last_clicked"):
+            new_lat = round(map_a["last_clicked"]["lat"], 4)
+            new_lon = round(map_a["last_clicked"]["lng"], 4)
+            if new_lat != st.session_state.lat_a or new_lon != st.session_state.lon_a:
+                st.session_state.lat_a = new_lat
+                st.session_state.lon_a = new_lon
+                st.rerun()
+        name_a = get_location_name(st.session_state.lat_a, st.session_state.lon_a)
+        st.info(f"📌 **{name_a}**")
+    
+    with col2:
+        st.markdown("### 🅱️ الموقع الثاني")        m_b = folium.Map(location=[st.session_state.lat_b, st.session_state.lon_b], zoom_start=10)
+        folium.Marker(
+            [st.session_state.lat_b, st.session_state.lon_b],
+            tooltip="الموقع B",
+            icon=folium.Icon(color="blue", icon="anchor", prefix="fa")
+        ).add_to(m_b)
+        map_b = st_folium(m_b, width=None, height=350, returned_objects=["last_clicked"], key="map_b")
+        if map_b and map_b.get("last_clicked"):
+            new_lat = round(map_b["last_clicked"]["lat"], 4)
+            new_lon = round(map_b["last_clicked"]["lng"], 4)
+            if new_lat != st.session_state.lat_b or new_lon != st.session_state.lon_b:
+                st.session_state.lat_b = new_lat
+                st.session_state.lon_b = new_lon
+                st.rerun()
+        name_b = get_location_name(st.session_state.lat_b, st.session_state.lon_b)
+        st.info(f"📌 **{name_b}**")
+
+st.divider()
+
+# ==========================================
+# PROCESSING
+# ==========================================
+st.subheader("⚙️ تحليل 3 أيام مع النماذج الفيزيائية")
+
+# Location A
+with st.spinner(f"تحليل {name_a}..."):
+    sn_a, fc_a, bt_a, err_a = calculate_shoreline_aspect(st.session_state.lat_a, st.session_state.lon_a)
+    if bt_a == "inland":
+        st.error(f"🚫 {name_a}: إحداثيات برية")
+        st.stop()
+    m_data_a, w_data_a, inland_a, err_f_a = fetch_marine_weather(st.session_state.lat_a, st.session_state.lon_a)
+    if err_f_a:
+        st.error(err_f_a)
+        st.stop()
+    days_a, err_s_a = compute_3day_scores(m_data_a, w_data_a, inland_a, sn_a, bt_a, fc_a)
+    if err_s_a:
+        st.error(err_s_a)
+        st.stop()
+
+# Location B
+days_b = None
+sn_b, fc_b, bt_b = None, None, None
+name_b_display = ""
+if st.session_state.compare_mode:
+    name_b_display = name_b
+    with st.spinner(f"تحليل {name_b_display}..."):
+        sn_b, fc_b, bt_b, err_b = calculate_shoreline_aspect(st.session_state.lat_b, st.session_state.lon_b)
+        if bt_b == "inland":
+            st.warning(f"⚠️ {name_b_display}: إحداثيات برية - تم تجاهل المقارنة")
+            st.session_state.compare_mode = False        else:
+            m_data_b, w_data_b, inland_b, err_f_b = fetch_marine_weather(st.session_state.lat_b, st.session_state.lon_b)
+            if err_f_b:
+                st.warning(f"فشل جلب بيانات الموقع B")
+            else:
+                days_b, err_s_b = compute_3day_scores(m_data_b, w_data_b, inland_b, sn_b, bt_b, fc_b)
+                if err_s_b:
+                    st.warning(f"فشل تحليل الموقع B: {err_s_b}")
+                    days_b = None
+
+info_a = {"name": name_a, "shoreline_normal": sn_a, "bay_type": bt_a, "fetch": fc_a}
+info_b = {
+    "name": name_b_display,
+    "shoreline_normal": sn_b,
+    "bay_type": bt_b,
+    "fetch": fc_b
+}
+
+st.success("✅ اكتمل التحليل الهيدروديناميكي الشامل")
+
+# ==========================================
+# 3-DAY VISUALIZATION
+# ==========================================
+st.subheader("📊 التصنيف العسكري والنماذج الفيزيائية")
+
+day_names = ["اليوم", "غداً", "بعد غد"]
+comparison_rows = []
+
+for i, (date_str, data_a) in enumerate(sorted(days_a.items())):
+    date_obj = datetime.fromisoformat(date_str).date()
+    classification, css_class, decision = classify_score(data_a["avg_score"])
+    
+    # اسم اليوم بالعربية
+    day_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"][date_obj.weekday()]
+    
+    st.markdown(f"### 📅 {day_names[i]} - {day_ar} {date_obj.strftime('%d/%m/%Y')}")
+    
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.markdown(f"**{name_a}**")
+        st.markdown(f"<span class='{css_class}'>{classification}</span>", unsafe_allow_html=True)
+        st.metric("المتوسط", f"{data_a['avg_score']}/10")
+    with col_m2:
+        st.markdown(f"**الثقة:** {data_a['confidence']}")
+        st.markdown(f"**البحر تاريخياً:** {'🟤 مدرر' if data_a['is_dirty'] else '🔵 نظيف'}")
+    with col_m3:
+        avg_longshore = sum(h["longshore_kmh"] for h in data_a["hourly"]) / len(data_a["hourly"])
+        st.metric("التيار الموازي (متوسط)", f"{avg_longshore:.1f} كم/س")
+    with col_m4:
+        drift_hours = sum(1 for h in data_a["hourly"] if h["lead_drift"])        st.metric("ساعات انجراف الرصاصة", f"{drift_hours}/{len(data_a['hourly'])}")
+    
+    # جدول A
+    df_a = pd.DataFrame(data_a["hourly"])
+    df_a_display = df_a[[
+        "time", "score", "wh", "wp", "ws", "impact",
+        "longshore_kmh", "lead_drift", "lead_recommended_g",
+        "rip_risk", "debris"
+    ]].copy()
+    df_a_display.columns = [
+        "الوقت", "النقاط", "الموج (م)", "الدور (ث)", "الرياح (كم/س)", "زاوية الاصطدام",
+        "التيار الموازي (كم/س)", "انجراف الرصاص", "وزن الرصاص (غ)",
+        "التيارات الساحبة", "الأعشاب"
+    ]
+    
+    if st.session_state.compare_mode and days_b and date_str in days_b:
+        data_b = days_b[date_str]
+        classification_b, css_class_b, _ = classify_score(data_b["avg_score"])
+        
+        col_t1, col_t2 = st.columns(2)
+        
+        with col_t1:
+            st.markdown(f"**🅰️ {name_a}** - <span class='{css_class}'>{classification}</span>", unsafe_allow_html=True)
+            st.dataframe(df_a_display, use_container_width=True, hide_index=True, height=300)
+        
+        with col_t2:
+            st.markdown(f"**🅱️ {name_b_display}** - <span class='{css_class_b}'>{classification_b}</span>", unsafe_allow_html=True)
+            df_b = pd.DataFrame(data_b["hourly"])
+            df_b_display = df_b[[
+                "time", "score", "wh", "wp", "ws", "impact",
+                "longshore_kmh", "lead_drift", "lead_recommended_g",
+                "rip_risk", "debris"
+            ]].copy()
+            df_b_display.columns = df_a_display.columns
+            st.dataframe(df_b_display, use_container_width=True, hide_index=True, height=300)
+        
+        winner = name_a if data_a["avg_score"] > data_b["avg_score"] else name_b_display if data_b["avg_score"] > data_a["avg_score"] else "تعادل"
+        diff = abs(data_a["avg_score"] - data_b["avg_score"])
+        st.info(f"🏆 **الأفضل لـ {day_names[i]}:** {winner} (فارق: {diff:.1f} نقطة)")
+        
+        comparison_rows.append({
+            "اليوم": f"{day_names[i]} ({day_ar})",
+            "الموقع A": f"{data_a['avg_score']}/10",
+            "الموقع B": f"{data_b['avg_score']}/10",
+            "الأفضل": winner,
+            "الفارق": diff
+        })
+    else:
+        st.dataframe(df_a_display, use_container_width=True, hide_index=True, height=350)
+        st.divider()
+
+# جدول المقارنة النهائي
+if st.session_state.compare_mode and comparison_rows:
+    st.subheader("⚖️ جدول المقارنة النهائي")
+    df_comp = pd.DataFrame(comparison_rows)
+    st.dataframe(df_comp, use_container_width=True, hide_index=True)
+
+# أفضل نافذة
+st.subheader("🎯 أفضل نافذة زمنية في الأيام الثلاثة")
+all_hours = []
+for date_str, data in days_a.items():
+    for h in data["hourly"]:
+        all_hours.append((h, name_a, date_str))
+if st.session_state.compare_mode and days_b:
+    for date_str, data in days_b.items():
+        for h in data["hourly"]:
+            all_hours.append((h, name_b_display, date_str))
+
+best_overall = max(all_hours, key=lambda x: x[0]["score"])
+st.success(f"""
+⭐ **أفضل ساعة على الإطلاق:**
+- 📍 الموقع: **{best_overall[1]}**
+- 📅 التاريخ: {best_overall[2]}
+- ⏰ الساعة: {best_overall[0]['time'][-5:]}
+- 🎯 النقاط: **{best_overall[0]['score']}/10**
+- 🌊 الموج: {best_overall[0]['wh']}م | 💨 الرياح: {best_overall[0]['ws']} كم/س
+- 🌊 التيار الموازي: {best_overall[0]['longshore_kmh']} كم/س
+- ⚓ وزن الرصاص الموصى به: **{best_overall[0]['lead_recommended_g']} جرام**
+""")
+
+st.divider()
+
+# ==========================================
+# GEMINI REPORT
+# ==========================================
+st.subheader("🧠 التقرير التكتيكي النهائي")
+
+with st.spinner("جاري إعداد التقرير العسكري الشامل..."):
+    report, err = generate_gemini_report(
+        days_a, days_b, info_a, info_b, st.session_state.compare_mode
+    )
+
+if err:
+    st.error(err)
+else:
+    st.markdown(report)
+
+st.divider()
+st.caption("© المحلل الهيدروديناميكي العسكري v5.0 | Longshore Current + Lead Drag + Rip Current + Surface Debris")
