@@ -1,6 +1,5 @@
 import streamlit as st
 import folium
-from folium import plugins
 from streamlit_folium import st_folium
 import requests
 import math
@@ -20,10 +19,10 @@ except ImportError:
 st.set_page_config(page_title="Surfcasting Predictor", layout="wide")
 st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcasting Dynamic Predictor)")
 
-# ---------- الحالة الدائمة ----------
+# ---------- الحالة الدائمة (تم فحصها يدوياً) ----------
 if "lat" not in st.session_state:
     st.session_state.lat = 36.4000
-if "lon" not in st.session_state.lon:
+if "lon" not in st.session_state:               # ✅ تم التصحيح هنا
     st.session_state.lon = 10.6000
 if "last_processed_coords" not in st.session_state:
     st.session_state.last_processed_coords = (None, None)
@@ -89,7 +88,6 @@ def get_shoreline_normal(lat: float, lon: float) -> float:
     angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
     return (angle + 360) % 360
 
-# ---------- دوال حسابية ----------
 def circular_diff(a: float, b: float) -> float:
     diff = abs(a - b) % 360
     return diff if diff <= 180 else 360 - diff
@@ -192,10 +190,9 @@ def generate_gemini_report(prompt: str) -> Optional[str]:
     if not GENAI_AVAILABLE or not os.environ.get("GEMINI_API_KEY"):
         return None
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # نماذج متوافقة مع الإصدار الحالي
     models_to_try = [
-        "gemini-2.0-flash-lite",
         "gemini-1.5-flash",
+        "gemini-2.0-flash-exp",
     ]
     for model_name in models_to_try:
         try:
@@ -208,8 +205,8 @@ def generate_gemini_report(prompt: str) -> Optional[str]:
             else:
                 raise e
     raise RuntimeError(
-        "جميع نماذج Gemini فشلت. تأكد من أن مفتاح API صالح وأن النماذج "
-        "`gemini-2.0-flash-lite` أو `gemini-1.5-flash` مفعلة في Google AI Studio."
+        "جميع نماذج Gemini فشلت. تأكد من صلاحية المفتاح وتفعيل النماذج "
+        "`gemini-1.5-flash` أو `gemini-2.0-flash-exp` في Google AI Studio."
     )
 
 def get_day_labels():
@@ -229,10 +226,9 @@ def get_day_labels():
 
 # ---------- التطبيق الرئيسي ----------
 def main():
-    # ---------- الخريطة مع الفيزور العائم ----------
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
 
-    # فيزور متحرك (دائرة زرقاء تتبع الماوس)
+    # فيزور متحرك
     cursor_js = """
     var cursorMarker = L.circleMarker([0,0], {
         radius: 8,
@@ -245,7 +241,6 @@ def main():
 
     map.on('mousemove', function(e) {
         cursorMarker.setLatLng(e.latlng);
-        // إرسال الإحداثيات إلى Streamlit عبر message
         if (typeof Streamlit !== 'undefined') {
             Streamlit.setComponentValue({live_lat: e.latlng.lat.toFixed(4), live_lng: e.latlng.lng.toFixed(4)});
         }
@@ -253,27 +248,22 @@ def main():
     """
     m.get_root().html.add_child(folium.Element(f"<script>{cursor_js}</script>"))
 
-    # علامة المكان المختار
     folium.Marker(
         [st.session_state.lat, st.session_state.lon],
         popup="📍 موقع الصيد",
         icon=folium.Icon(color="red", icon="anchor"),
     ).add_to(m)
 
-    # التقاط النقر
     map_data = st_folium(m, key="surfcast_map", height=450, width=700)
 
-    # تحديث الإحداثيات المباشرة من الفيزور (تأتي عبر st_folium من الـ JS)
-    if map_data and "live_lat" in map_data:
+    if map_data and isinstance(map_data, dict) and "live_lat" in map_data:
         st.session_state.live_coords = f"🖱️ {map_data['live_lat']}, {map_data['live_lng']}"
     else:
         st.session_state.live_coords = "حرك الفأرة فوق الخريطة"
 
-    # عرض الإحداثيات المباشرة
     st.caption(st.session_state.live_coords)
 
-    # معالجة النقرة النهائية
-    if map_data and map_data.get("last_clicked"):
+    if map_data and isinstance(map_data, dict) and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lon = map_data["last_clicked"]["lng"]
         if (new_lat, new_lon) != st.session_state.last_processed_coords:
@@ -283,7 +273,6 @@ def main():
             st.session_state.analysis_triggered = False
             st.rerun()
 
-    # ---------- واجهة الاختيار ----------
     day_labels = get_day_labels()
     day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
     day_offset = day_labels.index(day)
@@ -299,7 +288,6 @@ def main():
     if not st.session_state.analysis_triggered:
         return
 
-    # ---------- التحليل ----------
     with st.spinner("⏳ جاري جلب البيانات وتحليلها..."):
         marine_data = fetch_marine_data(lat, lon)
         fallback_used = False
@@ -307,8 +295,7 @@ def main():
         if marine_data is None:
             st.warning(
                 "⚠️ الإحداثيات المختارة بعيدة عن الساحل أو لا تتوفر بيانات بحرية لها. "
-                "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية. "
-                "يُرجى اختيار نقطة ساحلية للحصول على تحليل كامل."
+                "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية."
             )
             fallback_used = True
             atmospheric = fetch_atmospheric_fallback(lat, lon)
@@ -350,7 +337,6 @@ def main():
 
         avg_score = sum(r["score"] for r in results) / len(results)
 
-    # ---------- عرض الحكم ----------
     if avg_score >= 7.5:
         banner_color = "#28a745"
         verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
@@ -359,7 +345,7 @@ def main():
         verdict_text = "⚠️ ممكن بتكتيك خاص – الرحلة صعبة لكنها ممكنة باستخدام أثقال متخصصة ونوافذ التوقيت"
     else:
         banner_color = "#dc3545"
-        verdict_text = "🚫 مستحيل ووجب تغيير السبوت – إلغاء الرحلة أو تغيير المكان فوراً بسبب الأعشاب الكثيفة أو التيارات الجارفة"
+        verdict_text = "🚫 مستحيل ووجب تغيير السبوت – إلغاء الرحلة أو تغيير المكان فوراً"
 
     st.markdown(
         f"""
@@ -371,7 +357,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ---------- اسم المكان ----------
     try:
         reverse_url = "https://nominatim.openstreetmap.org/reverse"
         reverse_params = {
@@ -390,10 +375,9 @@ def main():
     except Exception:
         spot_name = "موقع الساحل المختار"
 
-    # ---------- تقرير Gemini ----------
     prompt = f"""
-أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين (مثل: بحر مدرر، مصفاة الموج، إيكوم، الريح الجنب، سبايك، ثقالة هرمية...).
-لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة، مع الإشارة الدقيقة إلى توقيت تحول البحر من حال إلى آخر.
+أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين.
+لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة.
 
 **اسم الموقع: {spot_name}**
 **اليوم المختار: {day}**
@@ -407,7 +391,7 @@ def main():
 2. ## سلوك الثقالة الميكانيكي وسرعة التيار (نيوتن والانجراف)
 3. ## تطور حزام الإيكوم الأبيض وقمم النشاط البيولوجي للأسماك
 4. ## الحكم النهائي القاطع (استثنائي، ممكن، أو مستحيل)
-5. ## الاستراتيجية التكتيكية للصيد (نوع الثقالة، وزنها، مسافة الرمي، تحسين الطعم) أو اقتراح نافذة جوية بديلة في حالة الإلغاء
+5. ## الاستراتيجية التكتيكية للصيد أو اقتراح نافذة جوية بديلة
 """
     try:
         with st.spinner("🧠 يولد التقرير الذكي..."):
