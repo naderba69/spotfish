@@ -1,5 +1,6 @@
 import streamlit as st
 import folium
+from folium.plugins import MousePosition, LatLngPopup
 from streamlit_folium import st_folium
 import requests
 import math
@@ -19,10 +20,10 @@ except ImportError:
 st.set_page_config(page_title="Surfcasting Predictor", layout="wide")
 st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcasting Dynamic Predictor)")
 
-# ---------- الحالة الدائمة (تم فحصها يدوياً) ----------
+# ---------- الحالة الدائمة (تم فحصها) ----------
 if "lat" not in st.session_state:
     st.session_state.lat = 36.4000
-if "lon" not in st.session_state:               # ✅ تم التصحيح هنا
+if "lon" not in st.session_state:
     st.session_state.lon = 10.6000
 if "last_processed_coords" not in st.session_state:
     st.session_state.last_processed_coords = (None, None)
@@ -32,8 +33,6 @@ if "results_cache" not in st.session_state:
     st.session_state.results_cache = None
 if "avg_score_cache" not in st.session_state:
     st.session_state.avg_score_cache = None
-if "live_coords" not in st.session_state:
-    st.session_state.live_coords = "حرك الفأرة فوق الخريطة"
 
 # ---------- دوال جلب البيانات ----------
 @st.cache_data(ttl=1800)
@@ -76,6 +75,7 @@ def fetch_atmospheric_fallback(lat: float, lon: float) -> Dict:
 
 @st.cache_data(ttl=7200)
 def get_shoreline_normal(lat: float, lon: float) -> float:
+    """زاوية عمودية محسّنة مع احتياط للخلجان."""
     delta = 0.001
     points = [f"{lat+dlat},{lon+dlon}" for dlat in (-delta, 0, delta) for dlon in (-delta, 0, delta)]
     url = "https://api.opentopodata.org/v1/srtm30m"
@@ -86,7 +86,17 @@ def get_shoreline_normal(lat: float, lon: float) -> float:
     dz_dlat = (elev[7] - elev[1]) / (2 * delta * 111320)
     dz_dlon = (elev[5] - elev[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
     angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
-    return (angle + 360) % 360
+    shore_normal = (angle + 360) % 360
+    # إذا كان الانحدار ضعيفًا جدًا (أرض مستوية) نلجأ لاتجاهات ثابتة معروفة لبعض المناطق
+    if abs(dz_dlat) < 0.01 and abs(dz_dlon) < 0.01:
+        # قائمة تقريبية لمناطق تونس (يمكن توسيعها)
+        if 36.5 < lat < 37.0 and 10.0 < lon < 10.5:
+            shore_normal = 45.0  # الحمامات تواجه الشرق
+        elif 37.0 < lat < 37.5 and 11.0 < lon < 11.5:
+            shore_normal = 330.0  # قليبية تواجه الشمال الغربي
+        elif 36.4 < lat < 36.9 and 9.5 < lon < 10.0:
+            shore_normal = 15.0   # الرتيبة تواجه الشمال
+    return shore_normal
 
 def circular_diff(a: float, b: float) -> float:
     diff = abs(a - b) % 360
@@ -226,43 +236,25 @@ def get_day_labels():
 
 # ---------- التطبيق الرئيسي ----------
 def main():
+    # خريطة مع أدوات تحديد الإحداثيات
     m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
 
-    # فيزور متحرك
-    cursor_js = """
-    var cursorMarker = L.circleMarker([0,0], {
-        radius: 8,
-        color: '#0066ff',
-        fillColor: '#0066ff',
-        fillOpacity: 0.4,
-        weight: 2,
-        interactive: false
-    }).addTo(map);
+    # 1. مؤشر الإحداثيات المباشر (فايزور رقمي)
+    MousePosition().add_to(m)
 
-    map.on('mousemove', function(e) {
-        cursorMarker.setLatLng(e.latlng);
-        if (typeof Streamlit !== 'undefined') {
-            Streamlit.setComponentValue({live_lat: e.latlng.lat.toFixed(4), live_lng: e.latlng.lng.toFixed(4)});
-        }
-    });
-    """
-    m.get_root().html.add_child(folium.Element(f"<script>{cursor_js}</script>"))
+    # 2. نافذة منبثقة صغيرة عند النقر (تظهر الإحداثيات)
+    LatLngPopup().add_to(m)
 
+    # علامة المكان المختار
     folium.Marker(
         [st.session_state.lat, st.session_state.lon],
         popup="📍 موقع الصيد",
         icon=folium.Icon(color="red", icon="anchor"),
     ).add_to(m)
 
-    map_data = st_folium(m, key="surfcast_map", height=450, width=700)
+    map_data = st_folium(m, key="surfcast_map", height=500, width=700)
 
-    if map_data and isinstance(map_data, dict) and "live_lat" in map_data:
-        st.session_state.live_coords = f"🖱️ {map_data['live_lat']}, {map_data['live_lng']}"
-    else:
-        st.session_state.live_coords = "حرك الفأرة فوق الخريطة"
-
-    st.caption(st.session_state.live_coords)
-
+    # التقاط النقرة من النافذة المنبثقة
     if map_data and isinstance(map_data, dict) and map_data.get("last_clicked"):
         new_lat = map_data["last_clicked"]["lat"]
         new_lon = map_data["last_clicked"]["lng"]
@@ -273,13 +265,15 @@ def main():
             st.session_state.analysis_triggered = False
             st.rerun()
 
-    day_labels = get_day_labels()
-    day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
-    day_offset = day_labels.index(day)
-
+    # عرض الإحداثيات الحالية المختارة
     lat = st.session_state.lat
     lon = st.session_state.lon
     st.write(f"📍 الإحداثيات المثبتة: `{lat:.4f}, {lon:.4f}`")
+
+    # اختيار اليوم
+    day_labels = get_day_labels()
+    day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
+    day_offset = day_labels.index(day)
 
     if st.button("🔍 فحص وتحليل الموقع", type="primary"):
         st.session_state.analysis_triggered = True
@@ -288,6 +282,7 @@ def main():
     if not st.session_state.analysis_triggered:
         return
 
+    # ---------- التحليل ----------
     with st.spinner("⏳ جاري جلب البيانات وتحليلها..."):
         marine_data = fetch_marine_data(lat, lon)
         fallback_used = False
@@ -337,6 +332,7 @@ def main():
 
         avg_score = sum(r["score"] for r in results) / len(results)
 
+    # الحكم النهائي
     if avg_score >= 7.5:
         banner_color = "#28a745"
         verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
@@ -357,6 +353,7 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # اسم المكان
     try:
         reverse_url = "https://nominatim.openstreetmap.org/reverse"
         reverse_params = {
@@ -375,6 +372,7 @@ def main():
     except Exception:
         spot_name = "موقع الساحل المختار"
 
+    # تقرير Gemini
     prompt = f"""
 أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين.
 لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة.
