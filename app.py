@@ -1,400 +1,380 @@
+import os
+import json
+import math
+import requests
 import streamlit as st
 import folium
-from folium.plugins import MousePosition
-from streamlit_folium import st_folium
-import requests
-import math
-import json
-import os
 import pandas as pd
-import datetime
-from typing import Dict, List, Optional
+from streamlit_folium import st_folium
+from datetime import datetime, timedelta, date
+import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-try:
-    import google.generativeai as genai
-    GENAI_AVAILABLE = True
-except ImportError:
-    GENAI_AVAILABLE = False
+# ══════════════════════════════════════════════════════════════
+# 1. CONFIG
+# ══════════════════════════════════════════════════════════════
+st.set_page_config(page_title="مستشار الصيد AI | تونس", page_icon="🎣",
+                   layout="wide", initial_sidebar_state="collapsed")
 
-# ---------- إعدادات الصفحة ----------
-st.set_page_config(page_title="Surfcasting Predictor", layout="wide")
-st.title("🌊 مقياس ديناميكية الصيد بالقصبة (Surfcasting Dynamic Predictor)")
+st.markdown("""
+<style>
+  body{direction:rtl}
+  .block-container{padding-top:1rem}
+  .go-box{background:#0a3d0a;padding:18px;border-radius:10px;border:2px solid #00ff00}
+  .nogo-box{background:#3d0a0a;padding:18px;border-radius:10px;border:2px solid #ff0000}
+  .warn-box{background:#3d2e0a;padding:18px;border-radius:10px;border:2px solid #ffa500}
+  .spot-card{background:#0a1a2e;padding:14px;border-radius:8px;border:1px solid #1f77b4;margin-bottom:10px}
+  .top-spot{background:#0a3d0a;padding:16px;border-radius:10px;border:2px solid #0f0;margin:8px 0}
+</style>
+""", unsafe_allow_html=True)
 
-# ---------- الحالة الدائمة (تم فحصها) ----------
-if "lat" not in st.session_state:
-    st.session_state.lat = 36.4000
-if "lon" not in st.session_state:
-    st.session_state.lon = 10.6000
-if "last_processed_coords" not in st.session_state:
-    st.session_state.last_processed_coords = (None, None)
-if "analysis_triggered" not in st.session_state:
-    st.session_state.analysis_triggered = False
-if "results_cache" not in st.session_state:
-    st.session_state.results_cache = None
-if "avg_score_cache" not in st.session_state:
-    st.session_state.avg_score_cache = None
+# ══════════════════════════════════════════════════════════════
+# 2. FAMOUS SPOTS DATABASE (قاعدة بيانات السبوتات)
+# ══════════════════════════════════════════════════════════════
+SPOTS_DATABASE = [
+    {"name": "رأس الدرك", "lat": 37.2742, "lon": 9.8739, "region": "بنزرت"},
+    {"name": "الهوارية", "lat": 37.0539, "lon": 11.0581, "region": "نابل"},
+    {"name": "قليبية", "lat": 36.8333, "lon": 11.1, "region": "نابل"},
+    {"name": "المنستير الشاطئ", "lat": 35.7672, "lon": 10.8111, "region": "المنستير"},
+    {"name": "المهدية الكورنيش", "lat": 35.5047, "lon": 11.0622, "region": "المهدية"},
+    {"name": "صفاقس رأس الطابية", "lat": 34.7333, "lon": 10.7633, "region": "صفاقس"},
+    {"name": "قابس الشاطئ", "lat": 33.8815, "lon": 10.0982, "region": "قابس"},
+    {"name": "جرجيس", "lat": 33.5042, "lon": 10.8681, "region": "مدنين"},
+    {"name": "جربة أجيم", "lat": 33.7167, "lon": 10.7667, "region": "جربة"},
+    {"name": "قرقنة", "lat": 34.7333, "lon": 11.1167, "region": "صفاقس"},
+    {"name": "بنزرت المرسى", "lat": 37.2744, "lon": 9.8628, "region": "بنزرت"},
+    {"name": "غار الملح", "lat": 37.1728, "lon": 10.0872, "region": "بنزرت"},
+    {"name": "رفراف الشاطئ", "lat": 37.1889, "lon": 10.1833, "region": "بنزرت"},
+    {"name": "الحمامات", "lat": 36.4, "lon": 10.6167, "region": "نابل"},
+    {"name": "سوسة بوجعفر", "lat": 35.8256, "lon": 10.6369, "region": "سوسة"},
+]
 
-# ---------- دوال جلب البيانات ----------
-@st.cache_data(ttl=1800)
-def fetch_marine_data(lat: float, lon: float) -> Optional[Dict]:
-    base_url = "https://marine-api.open-meteo.com/v1/marine"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wave_height,wave_direction,wave_period,wind_direction_10m,wind_speed_10m",
-        "past_days": 2,
-        "forecast_days": 3,
-        "timeformat": "iso8601",
-    }
+# ══════════════════════════════════════════════════════════════
+# 3. HELPERS (نفس الدوال السابقة)
+# ══════════════════════════════════════════════════════════════
+def destination_point(lat1, lon1, bearing, dist_km):
+    R = 6371.0
+    b = math.radians(bearing)
+    φ1, λ1 = math.radians(lat1), math.radians(lon1)
+    φ2 = math.asin(math.sin(φ1)*math.cos(dist_km/R) +
+                   math.cos(φ1)*math.sin(dist_km/R)*math.cos(b))
+    λ2 = λ1 + math.atan2(math.sin(b)*math.sin(dist_km/R)*math.cos(φ1),
+                         math.cos(dist_km/R) - math.sin(φ1)*math.sin(φ2))
+    return math.degrees(φ2), math.degrees(λ2)
+
+def circular_mean(angles):
+    if not angles: return 0.0
+    s = sum(math.sin(math.radians(a)) for a in angles) / len(angles)
+    c = sum(math.cos(math.radians(a)) for a in angles) / len(angles)
+    return math.degrees(math.atan2(s, c)) % 360
+
+def angle_diff(a, b):
+    d = abs(a - b) % 360
+    return d if d <= 180 else 360 - d
+
+def moon_factor(d):
+    delta = (d - date(2024, 1, 11)).days % 29.53
+    return round(0.5 + 0.5*abs(math.cos(2*math.pi*delta/29.53)), 3)
+
+# ══════════════════════════════════════════════════════════════
+# 4. API CALLS (مع cache)
+# ══════════════════════════════════════════════════════════════
+@st.cache_data(ttl=86400, show_spinner=False)
+def analyze_coast(lat, lon):
+    points = [destination_point(lat, lon, b, 3.0) for b in range(0, 360, 30)]
+    lats = ",".join(str(round(p[0], 4)) for p in points)
+    lons = ",".join(str(round(p[1], 4)) for p in points)
     try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if "hourly" in data and data["hourly"].get("wave_height"):
-            valid = [h for h in data["hourly"]["wave_height"] if h is not None]
-            if valid and max(valid) < 0.1:
-                return None
-        return data
-    except Exception:
-        return None
+        r = requests.get("https://api.open-meteo.com/v1/elevation",
+                         params={"latitude": lats, "longitude": lons}, timeout=15)
+        r.raise_for_status()
+        elevs = r.json().get("elevation", [])
+    except:
+        return None, "error"
 
-@st.cache_data(ttl=1800)
-def fetch_atmospheric_fallback(lat: float, lon: float) -> Dict:
-    base_url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "wind_speed_10m,wind_direction_10m",
-        "past_days": 2,
-        "forecast_days": 3,
-        "timeformat": "iso8601",
-    }
-    resp = requests.get(base_url, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    sea_bearings = [b for (_, _), b, e in
+                    zip(points, range(0, 360, 30), elevs)
+                    if e is not None and e <= 0.5]
+    if not sea_bearings:
+        return None, "inland"
 
-@st.cache_data(ttl=7200)
-def get_shoreline_normal(lat: float, lon: float) -> float:
-    """زاوية عمودية محسّنة مع احتياط للخلجان."""
-    delta = 0.001
-    points = [f"{lat+dlat},{lon+dlon}" for dlat in (-delta, 0, delta) for dlon in (-delta, 0, delta)]
-    url = "https://api.opentopodata.org/v1/srtm30m"
-    resp = requests.get(url, params={"locations": "|".join(points)}, timeout=10)
-    if resp.status_code != 200:
-        return 0.0
-    elev = [r["elevation"] for r in resp.json()["results"]]
-    dz_dlat = (elev[7] - elev[1]) / (2 * delta * 111320)
-    dz_dlon = (elev[5] - elev[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
-    angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
-    shore_normal = (angle + 360) % 360
-    # احتياطي للمناطق المسطحة (انحدار ضعيف جداً)
-    if abs(dz_dlat) < 0.01 and abs(dz_dlon) < 0.01:
-        if 36.5 < lat < 37.0 and 10.0 < lon < 10.5:
-            shore_normal = 45.0  # الحمامات
-        elif 37.0 < lat < 37.5 and 11.0 < lon < 11.5:
-            shore_normal = 330.0  # قليبية
-        elif 36.4 < lat < 36.9 and 9.5 < lon < 10.0:
-            shore_normal = 15.0   # الرتيبة
-    return shore_normal
+    exposure = len(sea_bearings) / len(points)
+    sn = circular_mean(sea_bearings)
+    return {"sn": round(sn, 1), "exposure": round(exposure, 2)}, None
 
-def circular_diff(a: float, b: float) -> float:
-    diff = abs(a - b) % 360
-    return diff if diff <= 180 else 360 - diff
-
-def safe_float(value, default=0.0):
-    return float(value) if value is not None else default
-
-def analyze_hour(hour_idx: int, hourly: Dict, baseline_dirty: bool, shore_normal: float) -> Dict:
-    wave_h   = safe_float(hourly["wave_height"][hour_idx])
-    wave_dir = safe_float(hourly["wave_direction"][hour_idx])
-    wave_per = safe_float(hourly["wave_period"][hour_idx])
-    wind_spd = safe_float(hourly["wind_speed_10m"][hour_idx])
-    wind_dir = safe_float(hourly["wind_direction_10m"][hour_idx])
-
-    wave_angle_diff = circular_diff(wave_dir, shore_normal)
-    wind_angle_diff = circular_diff(wind_dir, shore_normal)
-    wave_angle_rad = math.radians(wave_angle_diff)
-
-    wind_impact = "ريح وش مستقيمة وممتازة"
-    if 30 < wind_angle_diff < 150:
-        wind_impact = "ريح جنب مائلة جارفة"
-
-    V_longshore = 0.0
-    if wave_h > 0.1 and wave_angle_diff > 15:
-        V_longshore = 1.17 * math.sqrt(9.81 * wave_h) * math.sin(wave_angle_rad) * math.cos(wave_angle_rad)
-
-    A_exposed = 0.0025
-    rho = 1025
-    Cd = 1.5
-    F_drag = 0.5 * rho * Cd * A_exposed * (V_longshore ** 2)
-
-    if F_drag > 2.5:
-        lead_rec = "140g-150g سبايك (Spike)"
-    elif F_drag > 1.0:
-        lead_rec = "120g-130g هرمي (Pyramid)"
-    else:
-        lead_rec = "100g-110g ثقالة عادية"
-
-    rip_risk = "منخفض"
-    if wave_h > 1.2 and wave_per > 8.0 and wave_angle_diff < 30:
-        rip_risk = "عالي جداً (خطر الرمي في المجرى)"
-
-    wave_wind_diff = circular_diff(wave_dir, wind_dir)
-    opposing_wind = 90 < wave_wind_diff < 270
-
-    debris_status = "نظيف"
-    if baseline_dirty:
-        if 4 <= wave_per <= 7 and wave_h <= 1.1 and wave_angle_diff < 30 and opposing_wind:
-            debris_status = "البحر ينظف نفسه (مصفاة الموج تقذف العشب نحو الرمل)"
-        else:
-            debris_status = "بحر مدرر بكثافة"
-    else:
-        if wave_h > 1.2 and wave_per > 8.0:
-            debris_status = "بداية تقليب القاع واتساخ الماء"
-
-    score = 10.0
-    if wave_h < 0.2:
-        score -= 3.0
-    if debris_status == "بحر مدرر بكثافة":
-        score -= 4.5
-    if wind_impact == "ريح جنب مائلة جارفة":
-        score -= 4.0
-    if wave_h > 0.5 and 6 <= wave_per <= 10 and wave_angle_diff < 30:
-        score += 1.5
-    if debris_status == "البحر ينظف نفسه (مصفاة الموج تقذف العشب نحو الرمل)":
-        score += 2.0
-    score = max(0.0, min(10.0, score))
-
-    local_hour = (hour_idx % 24 + 1) % 24
-    time_str = f"{local_hour:02d}:00"
-
-    return {
-        "time": time_str,
-        "wave_height": round(wave_h, 2),
-        "wave_direction": round(wave_dir, 1),
-        "wave_period": round(wave_per, 1),
-        "wind_speed": round(wind_spd, 1),
-        "wind_direction": round(wind_dir, 1),
-        "wave_angle_diff": round(wave_angle_diff, 1),
-        "wind_angle_diff": round(wind_angle_diff, 1),
-        "wind_impact": wind_impact,
-        "V_longshore": round(V_longshore, 2),
-        "F_drag": round(F_drag, 2),
-        "lead_rec": lead_rec,
-        "rip_risk": rip_risk,
-        "debris_status": debris_status,
-        "score": round(score, 2),
-    }
-
-def render_table_report(results: List[Dict], spot_name: str, day_label: str, avg_score: float):
-    st.markdown(f"### 🧾 تقرير تفصيلي لـ {spot_name} - {day_label}")
-    df = pd.DataFrame(results)
-    st.dataframe(df[[
-        "time", "wave_height", "wave_direction", "wave_period",
-        "wind_speed", "wind_direction", "wind_impact", "V_longshore",
-        "F_drag", "lead_rec", "rip_risk", "debris_status", "score"
-    ]], use_container_width=True)
-
-def generate_gemini_report(prompt: str) -> Optional[str]:
-    if not GENAI_AVAILABLE or not os.environ.get("GEMINI_API_KEY"):
-        return None
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    models_to_try = [
-        "gemini-1.5-flash",
-        "gemini-2.0-flash-exp",
-    ]
-    for model_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
-                continue
-            else:
-                raise e
-    raise RuntimeError(
-        "جميع نماذج Gemini فشلت. تأكد من صلاحية المفتاح وتفعيل النماذج "
-        "`gemini-1.5-flash` أو `gemini-2.0-flash-exp` في Google AI Studio."
-    )
-
-def get_day_labels():
-    weekdays_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
-    today = datetime.date.today()
-    labels = []
-    for offset in range(3):
-        d = today + datetime.timedelta(days=offset)
-        weekday = weekdays_ar[d.weekday()]
-        if offset == 0:
-            labels.append(f"اليوم ({weekday})")
-        elif offset == 1:
-            labels.append(f"غداً ({weekday})")
-        else:
-            labels.append(f"بعد غد ({weekday})")
-    return labels
-
-# ---------- التطبيق الرئيسي ----------
-def main():
-    # خريطة مع أدوات تحديد الإحداثيات
-    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=7)
-
-    # 1. مؤشر الإحداثيات المباشر (فايزور رقمي)
-    MousePosition().add_to(m)
-
-    # 2. نافذة منبثقة صغيرة عند النقر (تظهر الإحداثيات)
-    folium.LatLngPopup().add_to(m)
-
-    # علامة المكان المختار
-    folium.Marker(
-        [st.session_state.lat, st.session_state.lon],
-        popup="📍 موقع الصيد",
-        icon=folium.Icon(color="red", icon="anchor"),
-    ).add_to(m)
-
-    map_data = st_folium(m, key="surfcast_map", height=500, width=700)
-
-    # التقاط النقرة من النافذة المنبثقة
-    if map_data and isinstance(map_data, dict) and map_data.get("last_clicked"):
-        new_lat = map_data["last_clicked"]["lat"]
-        new_lon = map_data["last_clicked"]["lng"]
-        if (new_lat, new_lon) != st.session_state.last_processed_coords:
-            st.session_state.lat = new_lat
-            st.session_state.lon = new_lon
-            st.session_state.last_processed_coords = (new_lat, new_lon)
-            st.session_state.analysis_triggered = False
-            st.rerun()
-
-    lat = st.session_state.lat
-    lon = st.session_state.lon
-    st.write(f"📍 الإحداثيات المثبتة: `{lat:.4f}, {lon:.4f}`")
-
-    day_labels = get_day_labels()
-    day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
-    day_offset = day_labels.index(day)
-
-    if st.button("🔍 فحص وتحليل الموقع", type="primary"):
-        st.session_state.analysis_triggered = True
-        st.rerun()
-
-    if not st.session_state.analysis_triggered:
-        return
-
-    # ---------- التحليل ----------
-    with st.spinner("⏳ جاري جلب البيانات وتحليلها..."):
-        marine_data = fetch_marine_data(lat, lon)
-        fallback_used = False
-
-        if marine_data is None:
-            st.warning(
-                "⚠️ الإحداثيات المختارة بعيدة عن الساحل أو لا تتوفر بيانات بحرية لها. "
-                "سيتم استخدام بيانات الرياح فقط من نموذج الطقس الجوي، وستُعتبر معاملات الأمواج صفرية."
-            )
-            fallback_used = True
-            atmospheric = fetch_atmospheric_fallback(lat, lon)
-            times = atmospheric["hourly"]["time"]
-            marine_data = {
-                "hourly": {
-                    "time": times,
-                    "wave_height": [0.0] * len(times),
-                    "wave_direction": [0.0] * len(times),
-                    "wave_period": [0.0] * len(times),
-                    "wind_speed_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_speed_10m"]],
-                    "wind_direction_10m": [safe_float(v) for v in atmospheric["hourly"]["wind_direction_10m"]],
-                }
-            }
-
-        hourly = marine_data["hourly"]
-
-        if not fallback_used:
-            past_h = [h for h in hourly["wave_height"][:48] if h is not None]
-            past_p = [p for p in hourly["wave_period"][:48] if p is not None]
-            avg_h = sum(past_h) / len(past_h) if past_h else 0
-            avg_p = sum(past_p) / len(past_p) if past_p else 0
-            sea_initially_dirty = avg_h > 1.2 and avg_p > 8.0
-        else:
-            sea_initially_dirty = False
-
-        shore_normal = get_shoreline_normal(lat, lon)
-
-        day_start = 48 + day_offset * 24
-        day_end = day_start + 24
-
-        if day_end > len(hourly["time"]):
-            st.error("❌ بيانات الساعة غير كافية لليوم المطلوب.")
-            st.stop()
-
-        results = []
-        for i in range(day_start, day_end):
-            results.append(analyze_hour(i, hourly, sea_initially_dirty, shore_normal))
-
-        avg_score = sum(r["score"] for r in results) / len(results)
-
-    # الحكم النهائي
-    if avg_score >= 7.5:
-        banner_color = "#28a745"
-        verdict_text = "✅ استثنائي (مميز) – البحر مثالي ونظيف والمرسى ثابت تماماً"
-    elif avg_score >= 5.0:
-        banner_color = "#fd7e14"
-        verdict_text = "⚠️ ممكن بتكتيك خاص – الرحلة صعبة لكنها ممكنة باستخدام أثقال متخصصة ونوافذ التوقيت"
-    else:
-        banner_color = "#dc3545"
-        verdict_text = "🚫 مستحيل ووجب تغيير السبوت – إلغاء الرحلة أو تغيير المكان فوراً"
-
-    st.markdown(
-        f"""
-        <div style="background-color:{banner_color};padding:15px;border-radius:10px;margin-bottom:20px">
-            <h2 style="color:white;text-align:center">{verdict_text}</h2>
-            <p style="color:white;text-align:center">المعدل العام: {avg_score:.2f} / 10</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # اسم المكان
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_data(lat, lon):
     try:
-        reverse_url = "https://nominatim.openstreetmap.org/reverse"
-        reverse_params = {
-            "format": "json",
-            "lat": lat,
-            "lon": lon,
-            "zoom": 10,
-            "accept-language": "ar",
-        }
-        headers = {"User-Agent": "SurfcastPredictor/1.0"}
-        geo_resp = requests.get(reverse_url, params=reverse_params, headers=headers, timeout=5)
-        if geo_resp.status_code == 200:
-            spot_name = geo_resp.json().get("display_name", "موقع الساحل المختار")
-        else:
-            spot_name = "موقع الساحل المختار"
-    except Exception:
-        spot_name = "موقع الساحل المختار"
+        marine = requests.get("https://marine-api.open-meteo.com/v1/marine", params={
+            "latitude": lat, "longitude": lon,
+            "hourly": "wave_height,wave_direction,wave_period,wind_wave_height,wind_wave_period,swell_wave_height,swell_wave_period,sea_surface_temperature",
+            "past_days": 2, "forecast_days": 3, "timezone": "auto"
+        }, timeout=20).json()
 
-    prompt = f"""
-أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين.
-لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة.
-
-**اسم الموقع: {spot_name}**
-**اليوم المختار: {day}**
-**المعدل العام: {avg_score:.2f} / 10**
-
-**البيانات الساعية (JSON):**
-{json.dumps(results, ensure_ascii=False, indent=2)}
-
-نظم التقرير بالعناوين التالية:
-1. ## التفصيل الزمني ساعة بساعة (حركة الأعشاب، العكارة، صفاء المياه)
-2. ## سلوك الثقالة الميكانيكي وسرعة التيار (نيوتن والانجراف)
-3. ## تطور حزام الإيكوم الأبيض وقمم النشاط البيولوجي للأسماك
-4. ## الحكم النهائي القاطع (استثنائي، ممكن، أو مستحيل)
-5. ## الاستراتيجية التكتيكية للصيد أو اقتراح نافذة جوية بديلة
-"""
-    try:
-        with st.spinner("🧠 يولد التقرير الذكي..."):
-            report = generate_gemini_report(prompt)
-            st.markdown(report, unsafe_allow_html=True)
+        weather = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": lat, "longitude": lon,
+            "hourly": "wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation",
+            "past_days": 2, "forecast_days": 3, "timezone": "auto"
+        }, timeout=20).json()
+        return marine, weather, None
     except Exception as e:
-        st.error(f"⚠️ تعذر توليد التقرير الذكي: {e}")
-        st.info("يُعرض جدول البيانات المباشر.")
-        render_table_report(results, spot_name, day, avg_score)
+        return None, None, str(e)
 
-if __name__ == "__main__":
-    main()
+def get_hourly_value(data, key, idx, default=0.0):
+    arr = data['hourly'].get(key, [])
+    if idx < len(arr) and arr[idx] is not None:
+        try: return float(arr[idx])
+        except: return default
+    return default
+
+# ══════════════════════════════════════════════════════════════
+# 5. SCORING ENGINE (مختصر لسرعة الفحص)
+# ══════════════════════════════════════════════════════════════
+def quick_score_spot(lat, lon, target_date):
+    """حساب سريع لسكور سبوت واحد"""
+    coast, err = analyze_coast(lat, lon)
+    if err: return 0.0
+    
+    marine, weather, err = fetch_data(lat, lon)
+    if err: return 0.0
+    
+    times = weather['hourly']['time']
+    scores = []
+    
+    for i, t in enumerate(times):
+        try: t_obj = datetime.fromisoformat(t)
+        except: continue
+        if t_obj.date() != target_date: continue
+        
+        score = 10.0
+        ws = get_hourly_value(weather, 'wind_speed_10m', i)
+        wdir = get_hourly_value(weather, 'wind_direction_10m', i)
+        gust = get_hourly_value(weather, 'wind_gusts_10m', i)
+        wh = get_hourly_value(marine, 'wave_height', i)
+        wd = get_hourly_value(marine, 'wave_direction', i)
+        sst = get_hourly_value(marine, 'sea_surface_temperature', i, 18)
+        
+        ws_eff = max(ws, gust * 0.7)
+        wdir_going = (wdir + 180) % 360
+        diff = angle_diff(wdir_going, coast['sn'])
+        
+        # Wind bonus/penalty
+        if diff <= 45: score += 1.5 if 8 <= ws_eff <= 25 else -0.5
+        elif diff >= 135: score += 1.0 if ws_eff <= 15 else -1.5
+        else: score -= 1.0
+        
+        # Wave
+        if wh < 0.3: score -= 3.0
+        
+        # Wind strength
+        if ws_eff > 55: score -= 5.0
+        elif ws_eff > 42: score -= 3.0
+        elif ws_eff > 32: score -= 1.5
+        
+        # SST
+        if sst < 15: score -= 2.0
+        elif 19 <= sst <= 24: score += 0.5
+        
+        score = max(0, min(10, score))
+        scores.append(score)
+    
+    if not scores: return 0.0
+    
+    # Weighted (prime hours)
+    prime = set(range(17, 24)) | set(range(4, 9))
+    tw, ts = 0.0, 0.0
+    for i, s in enumerate(scores):
+        hour = (i + 4) % 24  # تقريبي
+        w = 2.5 if hour in prime else 1.0
+        ts += s * w
+        tw += w
+    
+    return round(ts / tw if tw else 0, 1)
+
+# ══════════════════════════════════════════════════════════════
+# 6. AI SCOUT — الكلمة الأولى
+# ══════════════════════════════════════════════════════════════
+def scan_all_spots(target_date):
+    """فحص جميع السبوتات بشكل متوازي"""
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(quick_score_spot, spot['lat'], spot['lon'], target_date): spot
+            for spot in SPOTS_DATABASE
+        }
+        
+        for future in as_completed(futures):
+            spot = futures[future]
+            try:
+                score = future.result()
+                results.append({
+                    "name": spot['name'],
+                    "region": spot['region'],
+                    "lat": spot['lat'],
+                    "lon": spot['lon'],
+                    "score": score,
+                })
+            except:
+                pass
+    
+    # ترتيب تنازلي
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results
+
+# ══════════════════════════════════════════════════════════════
+# 7. UI — الواجهة الجديدة
+# ══════════════════════════════════════════════════════════════
+st.title("🤖 مستشار الصيد AI | الكلمة الأولى والأخيرة")
+st.markdown("**v9.0 — AI Scout: النظام يختار أفضل السبوتات تلقائياً**")
+
+# اختيار اليوم
+st.markdown("### 📅 1) اختر اليوم")
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("🔵 اليوم", use_container_width=True):
+        st.session_state.day_offset = 0
+with col2:
+    if st.button("🟢 غداً", use_container_width=True):
+        st.session_state.day_offset = 1
+with col3:
+    if st.button("🟡 بعد غد", use_container_width=True):
+        st.session_state.day_offset = 2
+
+if 'day_offset' not in st.session_state:
+    st.session_state.day_offset = 1
+
+target_date = date.today() + timedelta(days=st.session_state.day_offset)
+day_names = {0: "اليوم", 1: "غداً", 2: "بعد غد"}
+st.info(f"📆 **{day_names[st.session_state.day_offset]}** — {target_date.strftime('%Y-%m-%d')}")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════
+# 8. AI SCOUT — الفحص التلقائي
+# ══════════════════════════════════════════════════════════════
+st.markdown("### 🤖 الكلمة الأولى: AI يفحص تونس كلها...")
+
+if st.button("🚀 ابدأ الفحص الذكي", type="primary", use_container_width=True):
+    with st.spinner(f"🔍 فحص {len(SPOTS_DATABASE)} سبوت..."):
+        results = scan_all_spots(target_date)
+        st.session_state.scan_results = results
+        st.session_state.scanned = True
+        st.success("✅ انتهى الفحص!")
+
+if 'scanned' in st.session_state and st.session_state.scanned:
+    results = st.session_state.scan_results
+    
+    st.markdown("### 🏆 أفضل 5 سبوتات (حسب AI)")
+    
+    top5 = results[:5]
+    for i, spot in enumerate(top5, 1):
+        emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "⭐"
+        color = "#0f0" if spot['score'] >= 7 else "#ff0" if spot['score'] >= 5 else "#fa0"
+        
+        st.markdown(f"""
+        <div class='top-spot'>
+        {emoji} <b style='font-size:1.2em'>{spot['name']}</b> — {spot['region']}<br>
+        🎯 السكور: <b style='color:{color};font-size:1.3em'>{spot['score']}/10</b><br>
+        📍 {spot['lat']:.4f}, {spot['lon']:.4f}
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # الخريطة التفاعلية
+    st.markdown("### 🗺️ خريطة السبوتات (اللون = الجودة)")
+    m = folium.Map(location=[36.0, 9.5], zoom_start=7, tiles="CartoDB dark_matter")
+    
+    for spot in results:
+        if spot['score'] >= 7: color = 'green'
+        elif spot['score'] >= 5: color = 'orange'
+        else: color = 'red'
+        
+        folium.Marker(
+            [spot['lat'], spot['lon']],
+            popup=f"{spot['name']}<br>🎯 {spot['score']}/10",
+            tooltip=f"{spot['name']} — {spot['score']}/10",
+            icon=folium.Icon(color=color, icon='anchor', prefix='fa')
+        ).add_to(m)
+    
+    st_folium(m, width=None, height=500, key="scout_map")
+    
+    st.divider()
+    
+    # الجدول الكامل
+    st.markdown("### 📊 كل السبوتات مرتبة")
+    df = pd.DataFrame(results)
+    df_show = df[['name', 'region', 'score', 'lat', 'lon']].copy()
+    df_show.columns = ['الاسم', 'المنطقة', 'السكور', 'Lat', 'Lon']
+    
+    def color_score(v):
+        if v >= 7: return 'background:#0a3d0a;color:#0f0'
+        elif v >= 5: return 'background:#3d3d0a;color:#ff0'
+        elif v >= 4: return 'background:#3d2e0a;color:#fa0'
+        else: return 'background:#3d0a0a;color:#f44'
+    
+    styled = df_show.style.applymap(color_score, subset=['السكور'])
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+    
+    st.divider()
+    
+    # ══════════════════════════════════════════════════════════════
+    # 9. الكلمة الأخيرة
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("### ⚖️ الكلمة الأخيرة: مقارنة اختيارك")
+    
+    user_lat = st.number_input("📍 Latitude (اختيارك)", value=36.4561, format="%.5f")
+    user_lon = st.number_input("📍 Longitude (اختيارك)", value=10.7376, format="%.5f")
+    
+    if st.button("🔍 قيّم اختياري", use_container_width=True):
+        with st.spinner("⚡ تقييم موقعك..."):
+            user_score = quick_score_spot(user_lat, user_lon, target_date)
+            
+            st.markdown(f"### 🎯 سكور موقعك: **{user_score}/10**")
+            
+            if user_score >= 7:
+                st.markdown(f"""<div class='go-box'>
+                <h2 style='color:#0f0;text-align:center'>✅ اختيار ممتاز!</h2>
+                <p style='text-align:center'>موقعك من أفضل الخيارات اليوم</p>
+                </div>""", unsafe_allow_html=True)
+            
+            elif user_score >= 5:
+                st.markdown(f"""<div class='warn-box'>
+                <h2 style='color:#ff0;text-align:center'>🟡 مقبول لكن...</h2>
+                </div>""", unsafe_allow_html=True)
+                
+                # اقتراح بدائل
+                better = [s for s in results if s['score'] > user_score][:3]
+                if better:
+                    st.markdown("#### 💡 AI يقترح بدائل أفضل:")
+                    for b in better:
+                        diff = round(b['score'] - user_score, 1)
+                        st.markdown(f"""
+                        <div class='spot-card'>
+                        ✨ <b>{b['name']}</b> — {b['region']}<br>
+                        🎯 {b['score']}/10 (<span style='color:#0f0'>+{diff} نقطة</span>)<br>
+                        📍 {b['lat']:.4f}, {b['lon']:.4f}
+                        </div>
+                        """, unsafe_allow_html=True)
+            
+            else:
+                st.markdown(f"""<div class='nogo-box'>
+                <h2 style='color:#f44;text-align:center'>🔴 اختيار سيء!</h2>
+                </div>""", unsafe_allow_html=True)
+                
+                st.markdown("#### ⚠️ AI يرفض هذا السبوت ويقترح:")
+                for b in results[:3]:
+                    diff = round(b['score'] - user_score, 1)
+                    st.markdown(f"""
+                    <div class='top-spot'>
+                    ⭐ <b>{b['name']}</b> — {b['region']}<br>
+                    🎯 {b['score']}/10 (<span style='color:#0f0'>+{diff} نقاط</span>)<br>
+                    📍 {b['lat']:.4f}, {b['lon']:.4f}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+else:
+    st.info("👆 انقر على زر 'ابدأ الفحص الذكي' لكي يفحص AI كل السبوتات التونسية")
+
+st.caption("© مستشار الصيد AI v9.0 | الكلمة الأولى والأخيرة للذكاء الاصطناعي")
