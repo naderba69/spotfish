@@ -1,6 +1,6 @@
 import streamlit as st
 import folium
-from folium.plugins import MousePosition, LatLngPopup
+from folium.plugins import MousePosition
 from streamlit_folium import st_folium
 import requests
 import math
@@ -87,15 +87,14 @@ def get_shoreline_normal(lat: float, lon: float) -> float:
     dz_dlon = (elev[5] - elev[3]) / (2 * delta * 111320 * math.cos(math.radians(lat)))
     angle = math.degrees(math.atan2(-dz_dlon, -dz_dlat))
     shore_normal = (angle + 360) % 360
-    # إذا كان الانحدار ضعيفًا جدًا (أرض مستوية) نلجأ لاتجاهات ثابتة معروفة لبعض المناطق
+    # احتياطي للمناطق المسطحة (انحدار ضعيف جداً)
     if abs(dz_dlat) < 0.01 and abs(dz_dlon) < 0.01:
-        # قائمة تقريبية لمناطق تونس (يمكن توسيعها)
         if 36.5 < lat < 37.0 and 10.0 < lon < 10.5:
-            shore_normal = 45.0  # الحمامات تواجه الشرق
+            shore_normal = 45.0  # الحمامات
         elif 37.0 < lat < 37.5 and 11.0 < lon < 11.5:
-            shore_normal = 330.0  # قليبية تواجه الشمال الغربي
+            shore_normal = 330.0  # قليبية
         elif 36.4 < lat < 36.9 and 9.5 < lon < 10.0:
-            shore_normal = 15.0   # الرتيبة تواجه الشمال
+            shore_normal = 15.0   # الرتيبة
     return shore_normal
 
 def circular_diff(a: float, b: float) -> float:
@@ -243,7 +242,7 @@ def main():
     MousePosition().add_to(m)
 
     # 2. نافذة منبثقة صغيرة عند النقر (تظهر الإحداثيات)
-    LatLngPopup().add_to(m)
+    folium.LatLngPopup().add_to(m)
 
     # علامة المكان المختار
     folium.Marker(
@@ -265,12 +264,10 @@ def main():
             st.session_state.analysis_triggered = False
             st.rerun()
 
-    # عرض الإحداثيات الحالية المختارة
     lat = st.session_state.lat
     lon = st.session_state.lon
     st.write(f"📍 الإحداثيات المثبتة: `{lat:.4f}, {lon:.4f}`")
 
-    # اختيار اليوم
     day_labels = get_day_labels()
     day = st.selectbox("🗓️ حدد يوم الرحلة", day_labels)
     day_offset = day_labels.index(day)
@@ -372,7 +369,6 @@ def main():
     except Exception:
         spot_name = "موقع الساحل المختار"
 
-    # تقرير Gemini
     prompt = f"""
 أنت خبير صيد بالقصبة تونسي. قم بترجمة وسياق البيانات التالية إلى تقرير مفصل بالعربية الدارجة التونسية، باستخدام مصطلحات الصيادين المحليين.
 لا تغير أي قيمة حسابية أو نتيجة. اذكر الأسباب والنتائج ساعة بساعة.
